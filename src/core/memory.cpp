@@ -910,7 +910,7 @@ s32 MemoryManager::MapFile(void** out_addr, VAddr virtual_addr, u64 size, Memory
     // are 4KB, so host pages fully past EOF raise SIGBUS on access (e.g. IL2CPP
     // reading past the end of global-metadata.dat). Back that tail with anonymous
     // zero pages to match PS4 semantics.
-    const u64 file_size = file->handle->GetSize();
+    const u64 file_size = file->handle->Size();
     const u64 file_bytes =
         file_size > static_cast<u64>(phys_addr) ? file_size - static_cast<u64>(phys_addr) : 0;
     const u64 host_page = static_cast<u64>(sysconf(_SC_PAGESIZE));

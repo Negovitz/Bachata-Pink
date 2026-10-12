@@ -21,11 +21,6 @@ void PostProcessingPass::Create(const Instance& instance, Semaphore* work_semaph
     device = instance.GetDevice();
     uses_push_descriptors = instance.IsPushDescriptorSupported();
     desc_heap = DescriptorHeap{instance, work_semaphore, pool_sizes, 64};
-    static const std::array pp_shaders{
-        HostShaders::FS_TRI_VERT,
-        HostShaders::POST_PROCESS_FRAG,
-    };
-
     boost::container::static_vector<vk::DescriptorSetLayoutBinding, 2> bindings{
         {
             .binding = 0,

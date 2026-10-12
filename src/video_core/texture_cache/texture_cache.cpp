@@ -409,18 +409,8 @@ ImageId TextureCache::ResolveDimensionOverlap(const ImageInfo& requested_info,
         return {};
     }
 
-    const auto& copy_buffer = buffer_cache.GetUtilityBuffer(MemoryUsage::DeviceLocal);
-    const u64 copy_bytes = static_cast<u64>(cached_info.size.width) * cached_info.size.height *
-                           cached_info.size.depth * cached_info.num_bits / 8;
-    if (copy_bytes > copy_buffer.SizeBytes()) {
-        LOG_ERROR(Render_Vulkan, "Image dimension recreation needs {} bytes, buffer has {}",
-                  copy_bytes, copy_buffer.SizeBytes());
-        return {};
-    }
-
     const auto& new_info = requested_info;
-    const auto new_image_id =
-        slot_images.insert(instance, scheduler, blit_helper, slot_image_views, new_info);
+    const auto new_image_id = slot_images.insert(instance, runtime, slot_image_views, new_info);
     RegisterImage(new_image_id);
 
     auto& new_image = slot_images[new_image_id];
@@ -430,7 +420,7 @@ ImageId TextureCache::ResolveDimensionOverlap(const ImageInfo& requested_info,
     // Fold any pending CPU or buffer-cache changes into the old backing before moving its
     // authoritative contents through a dimension-neutral buffer copy.
     RefreshImage(source_image);
-    new_image.CopyImageWithBuffer(source_image, copy_buffer.Handle(), 0);
+    runtime.CopyImageWithBuffer(&source_image, &new_image);
     new_image.flags &= ~ImageFlagBits::Dirty;
     new_image.flags |= source_image.flags & ImageFlagBits::GpuModified;
 
