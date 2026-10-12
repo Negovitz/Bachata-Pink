@@ -33,24 +33,6 @@ vk::ImageViewType ConvertImageViewType(AmdGpu::ImageType type) {
     }
 }
 
-bool IsViewTypeCompatible(AmdGpu::ImageType view_type, AmdGpu::ImageType image_type) {
-    switch (view_type) {
-    case AmdGpu::ImageType::Color1D:
-    case AmdGpu::ImageType::Color1DArray:
-        return image_type == AmdGpu::ImageType::Color1D;
-    case AmdGpu::ImageType::Color2D:
-    case AmdGpu::ImageType::Color2DArray:
-    case AmdGpu::ImageType::Color2DMsaa:
-    case AmdGpu::ImageType::Color2DMsaaArray:
-        return image_type == AmdGpu::ImageType::Color2D || image_type == AmdGpu::ImageType::Color3D;
-    case AmdGpu::ImageType::Color3D:
-        return image_type == AmdGpu::ImageType::Color3D;
-    default:
-        AmdGpu::WarnInvalidDescriptorOnce("IsViewTypeCompatible", u32(view_type), "incompatible");
-        return false;
-    }
-}
-
 ImageViewInfo::ImageViewInfo(const AmdGpu::Image& image, const Shader::ImageResource& desc) noexcept
     : is_storage{desc.is_written} {
     const auto dfmt = image.GetDataFmt();
@@ -67,7 +49,7 @@ ImageViewInfo::ImageViewInfo(const AmdGpu::Image& image, const Shader::ImageReso
     range.base.layer = std::min<u32>(image.base_array, image.NumLayers() - 1);
     range.extent.levels = image.NumViewLevels(desc.is_array);
     range.extent.layers = image.NumViewLayers(desc.is_array);
-    type = image.GetViewType(desc.is_array);
+    type = desc.GetHostViewType(image);
     min_lod = static_cast<u32>(image.min_lod);
 
     if (!is_storage) {

@@ -21,10 +21,13 @@ static constexpr size_t PageFaultAreaSize = MaxPageFaults * sizeof(u64);
 
 FaultManager::FaultManager(const Vulkan::Instance& instance, Vulkan::Scheduler& scheduler_,
                            BufferCache& buffer_cache_, u32 sparse_pagebits, u64 sparse_num_pages_)
-    : scheduler{scheduler_}, buffer_cache{buffer_cache_}, sparse_pagesize{1ULL << sparse_pagebits},
-      sparse_num_pages{sparse_num_pages_}, fault_buffer_size{sparse_num_pages_ / 8},
+    : instance{instance}, scheduler{scheduler_}, buffer_cache{buffer_cache_},
+      sparse_pagesize{1ULL << sparse_pagebits}, sparse_num_pages{sparse_num_pages_},
+      fault_buffer_size{sparse_num_pages_ / 8},
       fault_buffer{instance, 0, fault_buffer_size, MemoryType::DeviceLocal},
-      download_buffer{instance, 0, MaxPendingFaults * PageFaultAreaSize, MemoryType::HostCached} {
+      download_buffer{instance, 0, MaxPendingFaults * PageFaultAreaSize, MemoryType::HostCached},
+      uses_push_descriptors{instance.IsPushDescriptorSupported()},
+      desc_heap{instance, scheduler.GetWorkSemaphore(), pool_sizes, 64} {
     const auto device = instance.GetDevice();
     Vulkan::SetObjectName(device, fault_buffer.Handle(), "Fault Buffer");
 
@@ -42,8 +45,11 @@ FaultManager::FaultManager(const Vulkan::Instance& instance, Vulkan::Scheduler& 
             .stageFlags = vk::ShaderStageFlagBits::eCompute,
         },
     }};
+    const vk::DescriptorSetLayoutCreateFlags layout_flags =
+        uses_push_descriptors ? vk::DescriptorSetLayoutCreateFlagBits::ePushDescriptorKHR
+                              : vk::DescriptorSetLayoutCreateFlagBits{};
     const vk::DescriptorSetLayoutCreateInfo desc_layout_ci = {
-        .flags = vk::DescriptorSetLayoutCreateFlagBits::ePushDescriptorKHR,
+        .flags = layout_flags,
         .bindingCount = 2,
         .pBindings = bindings.data(),
     };
@@ -151,8 +157,19 @@ void FaultManager::ProcessFaultBuffer() {
         .pBufferMemoryBarriers = &pre_barrier,
     });
     scheduler.BindPipeline(vk::PipelineBindPoint::eCompute, *fault_process_pipeline);
-    cmdbuf.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, *fault_process_pipeline_layout, 0,
-                                writes);
+    if (uses_push_descriptors) {
+        cmdbuf.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, *fault_process_pipeline_layout,
+                                    0, writes);
+    } else {
+        std::array<vk::WriteDescriptorSet, 2> set_writes = writes;
+        const auto desc_set = desc_heap.Commit(*fault_process_desc_layout);
+        for (auto& w : set_writes) {
+            w.dstSet = desc_set;
+        }
+        instance.GetDevice().updateDescriptorSets(set_writes, {});
+        cmdbuf.bindDescriptorSets(vk::PipelineBindPoint::eCompute, *fault_process_pipeline_layout, 0,
+                                  desc_set, {});
+    }
     // 1 bit per page, 32 pages per workgroup
     const u32 num_threads = sparse_num_pages / 32;
     const u32 num_workgroups = Common::DivCeil(num_threads, 64u);

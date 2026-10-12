@@ -493,8 +493,10 @@ Presenter::Presenter(Frontend::WindowSDL& window_, AmdGpu::Liverpool* liverpool_
     fsr_settings.rcas_attenuation =
         static_cast<float>(EmulatorSettings.GetRcasAttenuation() / 1000.f);
 
-    fsr_pass.Create(device, instance.GetAllocator(), num_images);
-    pp_pass.Create(device, swapchain.GetSurfaceFormat().format);
+    fsr_pass.Create(instance, draw_scheduler.GetWorkSemaphore(), device,
+                    instance.GetAllocator(), num_images);
+    pp_pass.Create(instance, draw_scheduler.GetWorkSemaphore(),
+                   swapchain.GetSurfaceFormat().format);
 
     dlssnr_settings.style = std::min(EmulatorSettings.GetDlssNrStyle(), 2u);
     dlssnr_settings.intensity =
@@ -665,6 +667,18 @@ Frame* Presenter::PrepareLastFrame() {
 }
 
 static vk::Format GetFrameViewFormat(const Libraries::VideoOut::PixelFormat format) {
+#ifdef ENABLE_BACHATA_RUNTIME
+    // Winlator's X11 DRI3 path exposes the guest frame with the opposite R/B
+    // memory order from desktop WSI. Compensate in the sampled image view.
+    switch (format) {
+    case Libraries::VideoOut::PixelFormat::A8B8G8R8Srgb:
+        return vk::Format::eB8G8R8A8Srgb;
+    case Libraries::VideoOut::PixelFormat::A8R8G8B8Srgb:
+        return vk::Format::eR8G8B8A8Srgb;
+    default:
+        break;
+    }
+#endif
     switch (format) {
     case Libraries::VideoOut::PixelFormat::A8B8G8R8Srgb:
         return vk::Format::eR8G8B8A8Srgb;
@@ -866,6 +880,9 @@ Frame* Presenter::PrepareBlankFrame(bool present_thread) {
 }
 
 void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame) {
+    static std::atomic_uint32_t present_traces{};
+    const u32 trace_id = present_traces.fetch_add(1, std::memory_order_relaxed);
+    const bool trace = trace_id < 32;
     // Free the frame for reuse
     const auto free_frame = [&] {
         if (!is_reusing_frame) {
@@ -889,6 +906,9 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
             free_frame();
             return;
         }
+    }
+    if (trace) {
+        LOG_INFO(Render_Vulkan, "BACHATA_PRESENT_TRACE id={} stage=acquire_done", trace_id);
     }
 
     // Reset fence for queue submission. Do it here instead of GetRenderFrame() because we may
@@ -1101,11 +1121,19 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
     info.AddSignal(swapchain.GetPresentReadySemaphore());
     info.AddSignal(frame->present_done);
     scheduler.Flush(info);
+    if (trace) {
+        LOG_INFO(Render_Vulkan, "BACHATA_PRESENT_TRACE id={} stage=flush_done", trace_id);
+    }
 
     // Present to swapchain.
     {
         std::scoped_lock submit_lock{Scheduler::submit_mutex};
-        if (!swapchain.Present()) {
+        const bool presented = swapchain.Present();
+        if (trace) {
+            LOG_INFO(Render_Vulkan, "BACHATA_PRESENT_TRACE id={} stage=present_done ok={}", trace_id,
+                     presented);
+        }
+        if (!presented) {
             swapchain.Recreate(window.GetWidth(), window.GetHeight());
         }
     }

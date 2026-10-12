@@ -10,6 +10,7 @@
 #include "common/types.h"
 #include "video_core/amdgpu/tiling.h"
 #include "video_core/buffer_cache/buffer.h"
+#include "video_core/renderer_vulkan/vk_resource_pool.h"
 
 namespace Vulkan {
 struct Runtime;
@@ -60,6 +61,13 @@ private:
     Vulkan::Scheduler& scheduler;
     Vulkan::Runtime& runtime;
     StreamBuffer& stream_buffer;
+    bool uses_push_descriptors{};
+    // Pool sizes must outlive desc_heap (DescriptorHeap stores a span to it).
+    static constexpr std::array<vk::DescriptorPoolSize, 2> pool_sizes{{
+        {vk::DescriptorType::eStorageBuffer, 64},
+        {vk::DescriptorType::eUniformBuffer, 64},
+    }};
+    Vulkan::DescriptorHeap desc_heap;
     vk::UniqueDescriptorSetLayout desc_layout;
     vk::UniquePipelineLayout pl_layout;
     std::unordered_map<TilingKey, vk::UniquePipeline, TilingKey::Hash> tiling_pipelines;

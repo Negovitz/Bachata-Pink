@@ -74,6 +74,7 @@ CommandPool::CommandPool(const Instance& instance, Semaphore* work_semaphore)
                vk::to_string(pool_result));
     cmd_pool = std::move(pool);
     SetObjectName(device, *cmd_pool, "CommandPool");
+    std::fprintf(stderr, "BACHATA_COMMAND_POOL_READY\n");
 }
 
 CommandPool::~CommandPool() = default;
@@ -111,11 +112,39 @@ DescriptorHeap::DescriptorHeap(const Instance& instance, Semaphore* work_semapho
 }
 
 DescriptorHeap::~DescriptorHeap() {
+    if (work_semaphore == nullptr) {
+        // Default-constructed, never-assigned heap. Nothing to destroy.
+        return;
+    }
     device.destroyDescriptorPool(curr_pool);
     for (const auto [pool, tick] : pending_pools) {
         work_semaphore->Wait(tick);
         device.destroyDescriptorPool(pool);
     }
+}
+
+DescriptorHeap& DescriptorHeap::operator=(DescriptorHeap&& other) noexcept {
+    if (this != &other) {
+        // Destroy our current state first (may be default-constructed/inert).
+        if (work_semaphore != nullptr) {
+            device.destroyDescriptorPool(curr_pool);
+            for (const auto [pool, tick] : pending_pools) {
+                work_semaphore->Wait(tick);
+                device.destroyDescriptorPool(pool);
+            }
+        }
+        device = other.device;
+        work_semaphore = other.work_semaphore;
+        descriptor_heap_count = other.descriptor_heap_count;
+        pool_sizes = other.pool_sizes;
+        curr_pool = other.curr_pool;
+        pending_pools = std::move(other.pending_pools);
+        descriptor_sets = std::move(other.descriptor_sets);
+        // Leave the source inert so its destructor is a no-op.
+        other.work_semaphore = nullptr;
+        other.curr_pool = nullptr;
+    }
+    return *this;
 }
 
 vk::DescriptorSet DescriptorHeap::Commit(vk::DescriptorSetLayout set_layout) {

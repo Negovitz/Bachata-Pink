@@ -107,6 +107,21 @@ void GameController::Axis(Input::Axis axis, int value, bool smooth) {
     PushStateLocked(timestamp);
 }
 
+void GameController::ApplyRemoteState(OrbisPadButtonDataOffset buttons,
+                                      const std::array<int, 6>& axes, bool touch_down,
+                                      float touch_x, float touch_y) {
+    std::lock_guard lock{m_state_mutex};
+    const u64 timestamp = Libraries::Kernel::sceKernelGetProcessTime();
+    m_state.connected = true;
+    m_state.connected_count = 1;
+    m_state.buttonsState = buttons;
+    for (int i = 0; i < std::to_underlying(Axis::AxisMax); ++i) {
+        m_state.OnAxis(static_cast<Input::Axis>(i), axes[i], timestamp, false);
+    }
+    m_state.OnTouchpad(0, touch_down, touch_x, touch_y);
+    PushStateLocked(timestamp);
+}
+
 void GameController::UpdateGyro(const float gyro[3]) {
     std::lock_guard lock{m_state_mutex};
     std::memcpy(gyro_buf, gyro, sizeof(gyro_buf));

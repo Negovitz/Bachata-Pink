@@ -4,7 +4,9 @@
 #pragma once
 
 #include <filesystem>
+#include <functional>
 #include <optional>
+#include <string_view>
 #include <thread>
 
 #include "common/singleton.h"
@@ -47,6 +49,9 @@ public:
 
     const char* executableName;
     bool waitForDebuggerBeforeRun{false};
+    std::function<void()> onRuntimeRunning;
+    std::function<void(std::string_view)> onRuntimeError;
+    std::function<void(int)> onRuntimeStopped;
 
 private:
     void LoadSystemModules(const std::string& game_serial);

@@ -17,6 +17,7 @@
 #include "core/address_space.h"
 #include "core/libraries/kernel/memory.h"
 #include "core/stack_ranges.h"
+#include "core/memory_map_generation.h"
 
 namespace Vulkan {
 class Rasterizer;
@@ -289,9 +290,16 @@ public:
 
     s32 UnmapMemory(VAddr virtual_addr, u64 size);
 
-    s32 QueryProtection(VAddr addr, void** start, void** end, u32* prot);
+    s32 QueryProtection(VAddr addr, void** start, void** end, u32* prot,
+                        u64* generation = nullptr);
+
+    [[nodiscard]] u64 MappingGeneration() const {
+        return mapping_generation.Load();
+    }
 
     s32 Protect(VAddr addr, u64 size, MemoryProt prot);
+
+    s32 SealGuestExecutable(VAddr addr, u64 size);
 
     s64 ProtectBytes(VAddr addr, VirtualMemoryArea& vma_base, u64 size, MemoryProt prot);
 
@@ -409,6 +417,7 @@ private:
     VMAMap vma_map;
     Common::SharedFirstMutex mutex{};
     std::mutex unmap_mutex{};
+    MemoryMapGeneration mapping_generation{};
     u64 total_direct_size{};
     u64 total_flexible_size{};
     u64 flexible_usage{};

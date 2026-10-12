@@ -7,6 +7,7 @@
 #include <fmt/format.h>
 #include "common/arch.h"
 #include "common/assert.h"
+#include "common/crash_reporter.h"
 #include "common/decoder.h"
 #include "common/guest_write_journal.h"
 #include "common/logging/events.h"
@@ -17,6 +18,9 @@
 #include "core/libraries/kernel/kernel.h"
 #include "core/libraries/kernel/threads/exception.h"
 #include "core/signals.h"
+#ifdef SHADPS4_ENABLE_FEX_GUEST_CPU
+#include "core/fex/fex_guest_engine.h"
+#endif
 #include "emulator.h"
 
 #ifdef _WIN32
@@ -676,6 +680,7 @@ static s32 NativeSiCodeToGuest(s32 sig, s32 code) {
 }
 
 void SignalHandler(int sig, siginfo_t* info, void* raw_context) {
+    Common::ReportCrash(raw_context, sig, info);
     using namespace Libraries::Kernel;
     auto* thread = g_curthread;
     const auto* signals = Signals::Instance();
@@ -695,13 +700,26 @@ void SignalHandler(int sig, siginfo_t* info, void* raw_context) {
     Ucontext* context_p = raw_context ? &context : nullptr;
 
     switch (sig) {
-    case SIGSEGV:
-    case SIGBUS: {
+    case SIGBUS:
+    case SIGSEGV: {
+#ifdef SHADPS4_ENABLE_FEX_GUEST_CPU
+        if (sig == SIGBUS && ::Core::Fex::HandleGuestSignal(sig, info, raw_context)) {
+            return;
+        }
+#endif
         const bool is_write = Common::IsWriteError(raw_context);
         if (!signals->DispatchAccessViolation(raw_context, info->si_addr)) {
             if (thread && thread->DispatchSignal(NativeToOrbisSignal(sig), info_p, context_p)) {
                 return;
             }
+#ifdef SHADPS4_ENABLE_FEX_GUEST_CPU
+            uint64_t guest_rip = 0;
+            uint64_t guest_rax = 0;
+            if (::Core::Fex::BachataQueryGuestRipSyscall(&guest_rip, &guest_rax)) {
+                LOG_CRITICAL(Debug, "FEX guest state at fault: rip={:#x} rax={:#x}", guest_rip,
+                             guest_rax);
+            }
+#endif
             UNREACHABLE_MSG("Unhandled access violation at code address {}: {} address {}",
                             fmt::ptr(code_address), is_write ? "Write to" : "Read from",
                             fmt::ptr(info->si_addr));
@@ -742,6 +760,7 @@ void SignalHandler(int sig, siginfo_t* info, void* raw_context) {
 #endif
 
 SignalDispatch::SignalDispatch() {
+    Common::InitCrashReporter();
 #if defined(_WIN32)
     ASSERT_MSG(handle = AddVectoredExceptionHandler(0, SignalHandler),
                "Failed to register exception handler.");

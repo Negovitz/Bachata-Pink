@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cstring>
 #include <memory>
 #include <mutex>
 #include <shared_mutex>
@@ -289,11 +290,15 @@ s32 PS4_SYSV_ABI sceAudioOutInit() {
         return ORBIS_AUDIO_OUT_ERROR_ALREADY_INIT;
     }
 
+#ifdef ENABLE_BACHATA_RUNTIME
+    audio = std::make_unique<BachataAudioOut>();
+#else
     if (EmulatorSettings.GetAudioBackend() == AudioBackend::OpenAL) {
         audio = std::make_unique<OpenALAudioOut>();
     } else {
         audio = std::make_unique<SDLAudioOut>();
     }
+#endif
 
     LOG_INFO(Lib_AudioOut, "Audio system initialized");
     return ORBIS_OK;
@@ -436,6 +441,17 @@ s32 PS4_SYSV_ABI sceAudioOutOpen(UserService::OrbisUserServiceUserId user_id,
              magic_enum::enum_name(port_type), _type, port_id, handle);
     return handle;
 }
+
+#ifdef SHADPS4_ENABLE_FEX_GUEST_CPU
+s32 PS4_SYSV_ABI fex_sceAudioOutOpen(UserService::OrbisUserServiceUserId user_id,
+                                     OrbisAudioOutPort port_type, s32 index, u32 length,
+                                     u32 sample_rate, u32 param_raw) {
+    OrbisAudioOutParamExtendedInformation param_type{};
+    static_assert(sizeof(param_type) == sizeof(param_raw));
+    std::memcpy(&param_type, &param_raw, sizeof(param_type));
+    return sceAudioOutOpen(user_id, port_type, index, length, sample_rate, param_type);
+}
+#endif
 
 s32 PS4_SYSV_ABI sceAudioOutClose(s32 handle) {
     LOG_INFO(Lib_AudioOut, "handle = {:#x}", handle);
@@ -1257,7 +1273,12 @@ void RegisterLib(Core::Loader::SymbolsResolver* sym) {
                  sceAudioOutMasteringSetParam);
     LIB_FUNCTION("RVWtUgoif5o", "libSceAudioOut", 1, "libSceAudioOut", sceAudioOutMasteringTerm);
     LIB_FUNCTION("-LXhcGARw3k", "libSceAudioOut", 1, "libSceAudioOut", sceAudioOutMbusInit);
+#ifdef SHADPS4_ENABLE_FEX_GUEST_CPU
+    LIB_FUNCTION("ekNvsT22rsY", "libSceAudioOut", 1, "libSceAudioOut",
+                 fex_sceAudioOutOpen);
+#else
     LIB_FUNCTION("ekNvsT22rsY", "libSceAudioOut", 1, "libSceAudioOut", sceAudioOutOpen);
+#endif
     LIB_FUNCTION("qLpSK75lXI4", "libSceAudioOut", 1, "libSceAudioOut", sceAudioOutOpenEx);
     LIB_FUNCTION("QOQtbeDqsT4", "libSceAudioOut", 1, "libSceAudioOut", sceAudioOutOutput);
     LIB_FUNCTION("w3PdaSTSwGE", "libSceAudioOut", 1, "libSceAudioOut", sceAudioOutOutputs);

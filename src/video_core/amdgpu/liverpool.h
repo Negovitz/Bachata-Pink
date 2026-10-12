@@ -247,6 +247,10 @@ private:
     u32 gpu_tid;
 #endif
     s32 curr_qid{-1};
+#ifdef ENABLE_BACHATA_RUNTIME
+    u32 debug_last_opcode{};
+    u64 debug_resume_count{};
+#endif
 };
 
 /// Recent PM4 packets and guest submits used by SHADPS4_CBUF_PROBE

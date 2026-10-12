@@ -45,6 +45,7 @@ struct BufferSpecialization {
 
 struct ImageSpecialization {
     AmdGpu::ImageType type = AmdGpu::ImageType::Color2D;
+    bool is_1d_hosted_as_2d = false;
     bool is_integer = false;
     bool is_storage = false;
     bool is_cube = false;
@@ -131,7 +132,8 @@ struct StageSpecialization {
                      });
         ForEachSharp(binding, images, info->images,
                      [&](auto& spec, const auto& desc, AmdGpu::Image sharp) {
-                         spec.type = sharp.GetViewType(desc.is_array);
+                         spec.type = desc.GetHostViewType(sharp);
+                         spec.is_1d_hosted_as_2d = desc.Is1DHostedAs2D(sharp);
                          spec.is_integer = AmdGpu::IsInteger(sharp.GetNumberFmt());
                          spec.is_storage = desc.is_written;
                          spec.is_cube = sharp.IsCube();

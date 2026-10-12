@@ -5,6 +5,7 @@
 #include <list>
 #include <mutex>
 #include <semaphore>
+#include <cstdio>
 
 #include "core/libraries/kernel/sync/semaphore.h"
 
@@ -309,7 +310,7 @@ public:
     bool is_fifo;
 };
 
-using OrbisKernelSema = Common::SlotId;
+using OrbisKernelSema = u32;
 
 static Common::SlotVector<std::unique_ptr<OrbisSem>> orbis_sems;
 
@@ -319,8 +320,10 @@ s32 PS4_SYSV_ABI sceKernelCreateSema(OrbisKernelSema* sem, const char* pName, u3
         LOG_ERROR(Lib_Kernel, "Semaphore creation parameters are invalid!");
         return ORBIS_KERNEL_ERROR_EINVAL;
     }
-    *sem = orbis_sems.insert(
-        std::move(std::make_unique<OrbisSem>(initCount, maxCount, pName, attr == 1)));
+    *sem = orbis_sems
+               .insert(std::move(
+                   std::make_unique<OrbisSem>(initCount, maxCount, pName, attr == 1)))
+               .index;
     return ORBIS_OK;
 }
 
@@ -376,6 +379,7 @@ s32 PS4_SYSV_ABI posix_sem_init(PthreadSem** sem, s32 /*pshared*/, u32 value) {
 }
 
 s32 PS4_SYSV_ABI posix_sem_destroy(PthreadSem** sem) {
+    printf("[POSIX SEM] destroy\n"); fflush(stdout);
     if (sem == nullptr || *sem == nullptr) {
         *__Error() = POSIX_EINVAL;
         return -1;
@@ -386,6 +390,7 @@ s32 PS4_SYSV_ABI posix_sem_destroy(PthreadSem** sem) {
 }
 
 s32 PS4_SYSV_ABI posix_sem_wait(PthreadSem** sem) {
+    printf("[POSIX SEM] wait begin\n"); fflush(stdout);
     if (sem == nullptr || *sem == nullptr) {
         *__Error() = POSIX_EINVAL;
         return -1;
@@ -422,6 +427,7 @@ s32 PS4_SYSV_ABI posix_sem_reltimedwait_np(PthreadSem** sem, u32 usec) {
 }
 
 s32 PS4_SYSV_ABI posix_sem_post(PthreadSem** sem) {
+    printf("[POSIX SEM] post\n"); fflush(stdout);
     if (sem == nullptr || *sem == nullptr) {
         *__Error() = POSIX_EINVAL;
         return -1;
@@ -545,6 +551,7 @@ void RegisterSemaphore(Core::Loader::SymbolsResolver* sym) {
     LIB_FUNCTION("IKP8typ0QUk", "libScePosix", 1, "libkernel", posix_sem_post);
     LIB_FUNCTION("Bq+LRV-N6Hk", "libScePosix", 1, "libkernel", posix_sem_getvalue);
 
+    // OpenOrbis / libkernel Posix aliases
     LIB_FUNCTION("pDuPEf3m4fI", "libkernel", 1, "libkernel", posix_sem_init);
     LIB_FUNCTION("cDW233RAwWo", "libkernel", 1, "libkernel", posix_sem_destroy);
     LIB_FUNCTION("YCV5dGGBcCo", "libkernel", 1, "libkernel", posix_sem_wait);

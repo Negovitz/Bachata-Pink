@@ -95,6 +95,9 @@ public:
 
     void Button(Libraries::Pad::OrbisPadButtonDataOffset button, bool isPressed);
     void Axis(Input::Axis axis, int value, bool smooth = true);
+    void ApplyRemoteState(Libraries::Pad::OrbisPadButtonDataOffset buttons,
+                          const std::array<int, 6>& axes, bool touch_down, float touch_x,
+                          float touch_y);
     void UpdateGyro(const float gyro[3]);
     void UpdateAcceleration(const float acceleration[3]);
     void PollState();

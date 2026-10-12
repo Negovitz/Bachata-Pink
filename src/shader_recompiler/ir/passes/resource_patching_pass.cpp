@@ -876,6 +876,7 @@ void PatchImageSampleArgs(IR::Inst& inst, Info& info, const ImageResource& image
     IR::IREmitter ir{*inst.GetParent(), IR::Block::InstructionList::s_iterator_to(inst)};
     const auto inst_info = inst.Flags<IR::TextureInstInfo>();
     const auto view_type = image.GetViewType(image_res.is_array);
+    const bool is_1d_hosted_as_2d = image_res.Is1DHostedAs2D(image);
 
     IR::Inst* body1 = inst.Arg(2).Inst();
     IR::Inst* body2 = inst.Arg(3).Inst();
@@ -924,6 +925,10 @@ void PatchImageSampleArgs(IR::Inst& inst, Info& info, const ImageResource& image
 
         switch (view_type) {
         case AmdGpu::ImageType::Color1D:
+            return is_1d_hosted_as_2d
+                       ? ir.CompositeConstruct(read(0),
+                                               ir.Imm32(ImageResource::Hosted2DIntegerY))
+                       : IR::Value{read(0)};
         case AmdGpu::ImageType::Color1DArray:
             return read(0);
         case AmdGpu::ImageType::Color2D:
@@ -943,7 +948,17 @@ void PatchImageSampleArgs(IR::Inst& inst, Info& info, const ImageResource& image
             return {};
         }
         switch (view_type) {
-        case AmdGpu::ImageType::Color1D:
+        case AmdGpu::ImageType::Color1D: {
+            // du/dx, du/dy
+            addr_reg = addr_reg + 2;
+            if (is_1d_hosted_as_2d) {
+                return {
+                    ir.CompositeConstruct(get_addr_reg(addr_reg - 2), ir.Imm32(0.0f)),
+                    ir.CompositeConstruct(get_addr_reg(addr_reg - 1), ir.Imm32(0.0f)),
+                };
+            }
+            return {get_addr_reg(addr_reg - 2), get_addr_reg(addr_reg - 1)};
+        }
         case AmdGpu::ImageType::Color1DArray:
             // du/dx, du/dy
             addr_reg = addr_reg + 2;
@@ -1000,7 +1015,10 @@ void PatchImageSampleArgs(IR::Inst& inst, Info& info, const ImageResource& image
         switch (view_type) {
         case AmdGpu::ImageType::Color1D: // x
             addr_reg = addr_reg + 1;
-            return get_coord(addr_reg - 1, 0);
+            return is_1d_hosted_as_2d
+                       ? ir.CompositeConstruct(get_coord(addr_reg - 1, 0),
+                                               ir.Imm32(ImageResource::Hosted2DSampleY))
+                       : get_coord(addr_reg - 1, 0);
         case AmdGpu::ImageType::Color1DArray: // x, slice
         case AmdGpu::ImageType::Color2D:      // x, y
         case AmdGpu::ImageType::Color2DMsaa:  // x, y
@@ -1079,12 +1097,20 @@ void PatchImageArgs(IR::Inst& inst, Info& info) {
     IR::IREmitter ir{*inst.GetParent(), IR::Block::InstructionList::s_iterator_to(inst)};
     auto inst_info = inst.Flags<IR::TextureInstInfo>();
     const auto view_type = image.GetViewType(image_res.is_array);
+    const bool is_1d_hosted_as_2d = image_res.Is1DHostedAs2D(image);
 
     // Now that we know the image type, adjust texture coordinate vector.
     IR::Inst* body = inst.Arg(1).Inst();
     const auto [coords, arg] = [&] -> std::pair<IR::Value, IR::Value> {
         switch (view_type) {
         case AmdGpu::ImageType::Color1D: // x, [lod]
+            if (is_1d_hosted_as_2d) {
+                const auto host_y =
+                    inst.GetOpcode() == IR::Opcode::ImageQueryLod
+                        ? IR::Value{ir.Imm32(ImageResource::Hosted2DSampleY)}
+                        : IR::Value{ir.Imm32(ImageResource::Hosted2DIntegerY)};
+                return {ir.CompositeConstruct(body->Arg(0), host_y), body->Arg(1)};
+            }
             return {body->Arg(0), body->Arg(1)};
         case AmdGpu::ImageType::Color1DArray: // x, slice, [lod]
         case AmdGpu::ImageType::Color2D:      // x, y, [lod]

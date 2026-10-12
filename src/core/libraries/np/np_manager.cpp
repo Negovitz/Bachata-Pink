@@ -1289,6 +1289,8 @@ void RegisterLib(Core::Loader::SymbolsResolver* sym) {
                  sceNpUnregisterStateCallback);
     LIB_FUNCTION("qQJfO8HAiaY", "libSceNpManager", 1, "libSceNpManager",
                  sceNpRegisterStateCallbackA);
+    LIB_FUNCTION("KswxLxk4c1Y", "libSceNpManager", 1, "libSceNpManager",
+                 sceNpRegisterGamePresenceCallbackA);
     LIB_FUNCTION("M3wFXbYQtAA", "libSceNpManager", 1, "libSceNpManager",
                  sceNpUnregisterStateCallbackA);
     LIB_FUNCTION("hw5KNqAAels", "libSceNpManager", 1, "libSceNpManager",

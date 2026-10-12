@@ -41,6 +41,8 @@ struct TilingInfo {
 TileManager::TileManager(const Vulkan::Instance& instance_, Vulkan::Scheduler& scheduler_,
                          Vulkan::Runtime& runtime_, StreamBuffer& stream_buffer_)
     : instance{instance_}, scheduler{scheduler_}, runtime{runtime_}, stream_buffer{stream_buffer_},
+      uses_push_descriptors{instance_.IsPushDescriptorSupported()},
+      desc_heap{instance_, scheduler_.GetWorkSemaphore(), pool_sizes, 64},
       gpu_overhead_cuts{EmulatorSettings.IsGpuOverheadCuts()},
       gpu_overhead_cuts_toggle{Common::PerfStats::AbToggleFollows("gpu_overhead_cuts")} {
     const auto device = instance.GetDevice();
@@ -65,8 +67,11 @@ TileManager::TileManager(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
         },
     }};
 
+    const vk::DescriptorSetLayoutCreateFlags layout_flags =
+        uses_push_descriptors ? vk::DescriptorSetLayoutCreateFlagBits::ePushDescriptorKHR
+                              : vk::DescriptorSetLayoutCreateFlagBits{};
     const vk::DescriptorSetLayoutCreateInfo desc_layout_ci = {
-        .flags = vk::DescriptorSetLayoutCreateFlagBits::ePushDescriptorKHR,
+        .flags = layout_flags,
         .bindingCount = static_cast<u32>(bindings.size()),
         .pBindings = bindings.data(),
     };
@@ -304,7 +309,17 @@ std::pair<const Buffer*, u64> TileManager::DetileImage(const VideoCore::Buffer* 
             .pBufferInfo = &params_buffer_info,
         },
     }};
-    cmdbuf.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, *pl_layout, 0, set_writes);
+    if (uses_push_descriptors) {
+        cmdbuf.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, *pl_layout, 0, set_writes);
+    } else {
+        const auto desc_set = desc_heap.Commit(*desc_layout);
+        std::array<vk::WriteDescriptorSet, 3> dst_writes = set_writes;
+        for (auto& w : dst_writes) {
+            w.dstSet = desc_set;
+        }
+        instance.GetDevice().updateDescriptorSets(dst_writes, {});
+        cmdbuf.bindDescriptorSets(vk::PipelineBindPoint::eCompute, *pl_layout, 0, desc_set, {});
+    }
 
     const auto dim_x = (info.guest_size / (info.num_bits / 8)) / 64;
     if (Vulkan::GpuCheckpoints::Enabled()) {
@@ -410,7 +425,17 @@ void TileManager::TileImage(Image& in_image, std::span<vk::BufferImageCopy> buff
             .pBufferInfo = &params_buffer_info,
         },
     }};
-    cmdbuf.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, *pl_layout, 0, set_writes);
+    if (uses_push_descriptors) {
+        cmdbuf.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, *pl_layout, 0, set_writes);
+    } else {
+        const auto desc_set = desc_heap.Commit(*desc_layout);
+        std::array<vk::WriteDescriptorSet, 3> dst_writes = set_writes;
+        for (auto& w : dst_writes) {
+            w.dstSet = desc_set;
+        }
+        instance.GetDevice().updateDescriptorSets(dst_writes, {});
+        cmdbuf.bindDescriptorSets(vk::PipelineBindPoint::eCompute, *pl_layout, 0, desc_set, {});
+    }
 
     const auto dim_x = (info.guest_size / (info.num_bits / 8)) / 64;
     if (Vulkan::GpuCheckpoints::Enabled()) {

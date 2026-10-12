@@ -11,6 +11,9 @@
 #include "core/libraries/kernel/orbis_error.h"
 #include "core/libraries/libs.h"
 #include "pthread.h"
+#ifdef SHADPS4_ENABLE_FEX_GUEST_CPU
+#include "core/guest_cpu/hle_call_adapter.h"
+#endif
 
 namespace Libraries::Kernel {
 
@@ -291,6 +294,9 @@ int PS4_SYSV_ABI sceKernelCreateEventFlag(OrbisKernelEventFlag* ef, const char* 
     }
 
     *ef = new EventFlagInternal(std::string(pName), thread_mode, queue_mode, initPattern);
+#ifdef SHADPS4_ENABLE_FEX_GUEST_CPU
+    (void)Core::GuestCpu::PublishHostRange(*ef, sizeof(EventFlagInternal), true);
+#endif
     return ORBIS_OK;
 }
 
@@ -299,6 +305,9 @@ int PS4_SYSV_ABI sceKernelDeleteEventFlag(OrbisKernelEventFlag ef) {
         return ORBIS_KERNEL_ERROR_ESRCH;
     }
 
+#ifdef SHADPS4_ENABLE_FEX_GUEST_CPU
+    (void)Core::GuestCpu::RevokeHostRange(ef);
+#endif
     delete ef;
     return ORBIS_OK;
 }

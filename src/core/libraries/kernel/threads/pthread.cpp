@@ -1,8 +1,11 @@
 // SPDX-FileCopyrightText: Copyright 2025-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <span>
+
 #include "common/assert.h"
 #include "common/cp_profiler.h"
+#include "common/singleton.h"
 #include "common/thread.h"
 #ifdef _WIN32
 #include "common/ntapi.h"
@@ -11,6 +14,9 @@
 #include <pthread.h>
 #endif
 #include "core/debug_state.h"
+#ifdef SHADPS4_ENABLE_FEX_GUEST_CPU
+#include "core/guest_cpu/guest_callback.h"
+#endif
 #include "core/libraries/kernel/kernel.h"
 #include "core/libraries/kernel/orbis_error.h"
 #include "core/libraries/kernel/posix_error.h"
@@ -18,12 +24,13 @@
 #include "core/libraries/kernel/threads/pthread.h"
 #include "core/libraries/kernel/threads/thread_state.h"
 #include "core/libraries/libs.h"
+#include "core/linker.h"
 #include "core/memory.h"
 
 #if defined(ARCH_X86_64) || defined(__arm64__) || defined(__aarch64__)
 extern "C" void* PS4_SYSV_ABI _runOnAnotherStack(void* arg, void* func,
                                                  void* stackb) asm("_runOnAnotherStack");
-#else
+#elif !defined(SHADPS4_ENABLE_FEX_GUEST_CPU)
 void* PS4_SYSV_ABI _runOnAnotherStack(void* arg, void* func, void* stackb) {
     UNREACHABLE_MSG("_runOnAnotherStack not implemented on target architecture.");
 }
@@ -100,13 +107,31 @@ void PS4_SYSV_ABI posix_pthread_exit(void* status) {
     while (!curthread->cleanup.empty()) {
         PthreadCleanup* old = curthread->cleanup.front();
         curthread->cleanup.pop_front();
+#ifdef SHADPS4_ENABLE_FEX_GUEST_CPU
+        if (Core::GuestCpu::IsGuestFunctionAddress(reinterpret_cast<const void*>(old->routine))) {
+            Core::GuestCpu::RunGuestFunctionOrAbort(
+                reinterpret_cast<void*>(old->routine), "pthread cleanup", old->routine_arg);
+        } else {
+            old->routine(old->routine_arg);
+        }
+#else
         old->routine(old->routine_arg);
+#endif
         if (old->onheap) {
             delete old;
         }
     }
     if (ThreadDtors) {
+#ifdef SHADPS4_ENABLE_FEX_GUEST_CPU
+        if (Core::GuestCpu::IsGuestFunctionAddress(reinterpret_cast<const void*>(ThreadDtors))) {
+            Core::GuestCpu::RunGuestFunctionOrAbort(reinterpret_cast<void*>(ThreadDtors),
+                                                     "pthread thread dtors");
+        } else {
+            (ThreadDtors)();
+        }
+#else
         (ThreadDtors)();
+#endif
     }
     ExitThread();
 }
@@ -271,7 +296,21 @@ static void* RunThread(void* arg) {
     /* Run the current thread's start routine with argument: */
     auto* const stack =
         (void*)(((size_t)curthread->attr.stackaddr_attr + curthread->attr.stacksize_attr) & (~15));
+#ifdef SHADPS4_ENABLE_FEX_GUEST_CPU
+    void* ret{};
+    if (Core::GuestCpu::IsGuestFunctionAddress(
+            reinterpret_cast<const void*>(curthread->start_routine))) {
+        const std::array<u64, 1> start_arguments{reinterpret_cast<u64>(curthread->arg)};
+        const auto guest_result = Core::GuestCpu::RunGuestFunctionOrAbort(
+            reinterpret_cast<void*>(curthread->start_routine), start_arguments,
+            "pthread start", reinterpret_cast<VAddr>(stack));
+        ret = reinterpret_cast<void*>(guest_result);
+    } else {
+        ret = curthread->start_routine(curthread->arg);
+    }
+#else
     void* ret = _runOnAnotherStack(curthread->arg, (void*)curthread->start_routine, stack);
+#endif
 
     /* Remove thread from tracking */
     DebugState.RemoveCurrentThreadFromGuestList();
@@ -469,7 +508,16 @@ int PS4_SYSV_ABI posix_pthread_once(PthreadOnce* once_control,
 
     PthreadCleanup cup{once_cancel_handler, once_control, 0};
     g_curthread->cleanup.push_front(&cup);
+#ifdef SHADPS4_ENABLE_FEX_GUEST_CPU
+    if (Core::GuestCpu::IsGuestFunctionAddress(reinterpret_cast<const void*>(init_routine))) {
+        Core::GuestCpu::RunGuestFunctionOrAbort(reinterpret_cast<void*>(init_routine),
+                                                 "pthread once");
+    } else {
+        init_routine();
+    }
+#else
     init_routine();
+#endif
     g_curthread->cleanup.pop_front();
 
     auto state = PthreadOnceState::InProgress;

@@ -145,6 +145,9 @@ enum class MipStorageFallbackMode : u16 {
 };
 
 struct ImageResource {
+    static constexpr f32 Hosted2DSampleY = 0.5f;
+    static constexpr u32 Hosted2DIntegerY = 0u;
+
     SharpFetch<AmdGpu::Image> sharp_fetch{};
     bool is_depth{};
     bool is_atomic{};
@@ -159,6 +162,18 @@ struct ImageResource {
     /// and catches out-of-range indices
     u16 array_size{};
     u16 array_stride_dw{};
+
+    bool Is1DHostedAs2D(const AmdGpu::Image& sharp) const noexcept {
+        return !is_array && !is_written && !is_depth && !is_atomic && !is_r128 &&
+               sharp.GetType() == AmdGpu::ImageType::Color1D && sharp.height == 0 &&
+               sharp.NumLayers() == 1 && sharp.NumLevels() == 1 && sharp.NumSamples() == 1 &&
+               sharp.GetTileMode() == AmdGpu::TileMode::Thin2DThin;
+    }
+
+    AmdGpu::ImageType GetHostViewType(const AmdGpu::Image& sharp) const noexcept {
+        return Is1DHostedAs2D(sharp) ? AmdGpu::ImageType::Color2D
+                                    : sharp.GetViewType(is_array);
+    }
 
     /// For descriptor arrays, the first valid element: it types the whole array
     constexpr AmdGpu::Image GetSharp(const auto& info) const noexcept {

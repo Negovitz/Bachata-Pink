@@ -162,6 +162,12 @@ s32 PS4_SYSV_ABI posix_sigdelset(Sigset* s, s32 sig);
 s32 PS4_SYSV_ABI posix_sigismember(Sigset const* s, s32 sig);
 bool PS4_SYSV_ABI posix_sigisemptyset(Sigset* s);
 
+// Guest stack top for FEX soft-exception delivery (aligned). Returns 0 when the
+// current Orbis pthread has no usable guest stack. Strong definition lives in
+// exception.cpp; fex_guest_engine provides a weak stub so FEXCore-only harness
+// builds do not pull pthread/logging (spdlog) into the probe target.
+u64 FexCurrentGuestStackTop() noexcept;
+
 void RegisterException(Core::Loader::SymbolsResolver* sym);
 
 } // namespace Libraries::Kernel

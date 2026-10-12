@@ -1,0 +1,225 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Fork-only: build the FULL fdroid runtime payload FROM SOURCE (box64 + FEXCore +
+# shadPS4-arm64 + Debian imagefs + Vortek client), stage it into the gitignored
+# jniLibs/ + assets/runtime/ dirs, then assemble + testkey-sign the fdroid APK and
+# publish it as a release. Turnip is intentionally NOT bundled (fdroid downloads it
+# at runtime, same as upstream). Two jobs so the heavy native build gets its own
+# disk budget and the APK job reuses the proven signing pipeline.
+name: fdroid Full Release (runtime + APK)
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Git ref (tag/branch/sha) to build"
+        default: "v0.1.7"
+        required: true
+      version_name:
+        default: "0.1.7"
+        required: true
+      version_code:
+        default: "26080313"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  runtime:
+    runs-on: ubuntu-24.04
+    container:
+      image: debian:trixie
+    steps:
+      - name: Install build dependencies
+        run: |
+          set -eux
+          export DEBIAN_FRONTEND=noninteractive
+          dpkg --add-architecture arm64
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            ca-certificates git curl xz-utils zstd zip unzip file patchelf pkg-config dpkg-dev \
+            cmake ninja-build clang llvm lld gcc g++ make \
+            gcc-aarch64-linux-gnu g++-aarch64-linux-gnu binutils-aarch64-linux-gnu \
+            python3 python3-pyelftools nodejs \
+            libvulkan-dev libsdl2-dev libc6-dev libudev-dev uuid-dev \
+            libx11-dev:arm64 libxext-dev:arm64 libudev-dev:arm64 uuid-dev:arm64 \
+            libc6:arm64 libgcc-s1:arm64 libstdc++6:arm64 libvulkan1:arm64 libudev1:arm64 libuuid1:arm64 \
+            libx11-6:arm64 libx11-xcb1:arm64 libxcursor1:arm64 libxext6:arm64 libxfixes3:arm64 libxi6:arm64 \
+            libxrandr2:arm64 libxrender1:arm64 libxss1:arm64 libxcb1:arm64 libxcb-dri3-0:arm64 libxcb-present0:arm64 \
+            libxcb-randr0:arm64 libxcb-render0:arm64 libxcb-shm0:arm64 libxcb-sync1:arm64 libxau6:arm64 libxdmcp6:arm64 \
+            libxkbcommon0:arm64 libdbus-1-3:arm64 libsystemd0:arm64 zlib1g:arm64 libdrm2:arm64 \
+            xkb-data
+          node --version; cmake --version | head -1; clang --version | head -1
+
+      - name: Checkout source (+ submodules for shadPS4 externals & box64)
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Trust workspace (container git)
+        run: git config --global --add safe.directory '*'
+
+      - name: Vendor Vortek server + client sources
+        run: |
+          set -eux
+          runtime/scripts/checkout-component.sh \
+            winlator-app https://github.com/brunodev85/winlator-app.git \
+            e113da42beefc39c69c8944b27c19c3703bfa856
+          runtime/scripts/vendor-vortek.sh
+
+      - name: Build Vortek client (aarch64-glibc libvulkan_vortek.so)
+        run: runtime/scripts/build-vortek-client.sh
+
+      - name: Build shadPS4 x86_64 (stub, FAST_FDROID_BUILD)
+        run: FAST_FDROID_BUILD=1 runtime/scripts/build-shadps4-x86_64.sh
+
+      - name: Build box64 host (glibc aarch64)
+        run: runtime/scripts/build-box64-host.sh
+
+      - name: Build FEXCore + shadPS4 arm64
+        run: |
+          df -h /
+          bash runtime/scripts/build-shadps4-arm64.sh
+          # Reclaim the heavy object trees now that stage binaries are captured.
+          rm -rf runtime/build/shadps4-arm64 runtime/build/fexcore-smoke-build runtime/build/shadps4 2>/dev/null || true
+          df -h /
+
+      - name: Stage Debian runtime rootfs
+        run: node runtime/scripts/stage-debian-runtime.mjs
+
+      - name: Package runtime payload
+        run: node runtime/scripts/package-runtime.mjs
+
+      - name: Collect staged outputs
+        run: |
+          set -eux
+          mkdir -p out
+          cp -a android/BachataS4/core/runtime/src/main/jniLibs out/jniLibs
+          cp -a android/BachataS4/app/src/main/assets/runtime out/assets-runtime
+          echo "=== jniLibs ==="; ls -la out/jniLibs/arm64-v8a
+          echo "=== assets/runtime ==="; ls -la out/assets-runtime
+          du -sh out/assets-runtime/runtime.zip
+
+      - name: Upload runtime staging artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: bachata-runtime-staging
+          path: out/
+          retention-days: 3
+
+  apk:
+    needs: runtime
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+          submodules: false
+          fetch-depth: 0
+
+      - name: Init libadrenotools submodule (APK JNI needs it)
+        run: git submodule update --init --recursive externals/winlator-app
+
+      - name: Vendor Vortek server sources (APK JNI CMake needs runtime/sources/winlator-app)
+        run: |
+          runtime/scripts/checkout-component.sh \
+            winlator-app https://github.com/brunodev85/winlator-app.git \
+            e113da42beefc39c69c8944b27c19c3703bfa856
+
+      - name: Download runtime staging artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: bachata-runtime-staging
+          path: staging
+
+      - name: Place runtime into tree
+        run: |
+          set -eux
+          mkdir -p android/BachataS4/core/runtime/src/main/jniLibs
+          mkdir -p android/BachataS4/app/src/main/assets/runtime
+          cp -a staging/jniLibs/. android/BachataS4/core/runtime/src/main/jniLibs/
+          cp -a staging/assets-runtime/. android/BachataS4/app/src/main/assets/runtime/
+          echo "=== placed jniLibs ==="; ls -la android/BachataS4/core/runtime/src/main/jniLibs/arm64-v8a
+          echo "=== placed assets/runtime ==="; ls -la android/BachataS4/app/src/main/assets/runtime
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install NDK / CMake / build-tools / platform
+        run: |
+          yes | sdkmanager --licenses >/dev/null 2>&1 || true
+          sdkmanager --install "build-tools;36.0.0" "ndk;30.0.14904198" "cmake;3.22.1"
+          if ! sdkmanager --install "platforms;android-37"; then
+            for ch in 1 2 3; do
+              yes | sdkmanager --channel=$ch --licenses >/dev/null 2>&1 || true
+              sdkmanager --channel=$ch --install "platforms;android-37" && break
+            done
+          fi
+          sdkmanager --list_installed 2>/dev/null | grep -i 'platforms;android' || true
+
+      - name: Build fdroid release (unsigned)
+        working-directory: android/BachataS4
+        run: |
+          chmod +x gradlew
+          ./gradlew :app:assembleFdroidRelease \
+            -PVERSION_NAME=${{ inputs.version_name }} \
+            -PVERSION_CODE=${{ inputs.version_code }} \
+            --no-daemon --stacktrace
+
+      - name: Locate unsigned APK
+        id: apk
+        working-directory: android/BachataS4
+        run: |
+          f=$(find app/build/outputs/apk/fdroid/release -name '*.apk' | head -1)
+          if [ -z "$f" ]; then echo "No APK produced" >&2; exit 1; fi
+          echo "path=$GITHUB_WORKSPACE/android/BachataS4/$f" >> "$GITHUB_OUTPUT"
+
+      - name: Fetch AOSP testkey
+        run: |
+          base=https://raw.githubusercontent.com/aosp-mirror/platform_build/main/target/product/security
+          mkdir -p signing
+          curl -fsSL -o signing/testkey.pk8 "$base/testkey.pk8"
+          curl -fsSL -o signing/testkey.x509.pem "$base/testkey.x509.pem"
+
+      - name: Zipalign + sign (v1 v2 v3)
+        id: sign
+        run: |
+          BT="$ANDROID_HOME/build-tools/36.0.0"
+          OUT="bachatas4-${{ inputs.version_name }}-release.apk"
+          "$BT/zipalign" -p -f 4 "${{ steps.apk.outputs.path }}" aligned.apk
+          "$BT/apksigner" sign \
+            --key signing/testkey.pk8 --cert signing/testkey.x509.pem \
+            --v1-signing-enabled true --v2-signing-enabled true \
+            --v3-signing-enabled true --v4-signing-enabled false \
+            --out "$OUT" aligned.apk
+          "$BT/apksigner" verify --min-sdk-version 21 --verbose --print-certs "$OUT" | grep -iE 'Verified using|Number of signers'
+          echo "size: $(stat -c%s "$OUT") bytes"
+          echo "out=$OUT" >> "$GITHUB_OUTPUT"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: bachatas4-${{ inputs.version_name }}-fdroid-release
+          path: ${{ steps.sign.outputs.out }}
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="v${{ inputs.version_name }}"
+          OUT="${{ steps.sign.outputs.out }}"
+          NOTES="Full from-source fork build of ${TAG} (ref \`${{ inputs.ref }}\`). fdroid flavor, arm64-v8a, with the complete runtime payload (box64 + FEXCore + shadPS4-arm64 + Debian imagefs + Vortek) built from source. Turnip is fetched in-app at runtime (upstream behavior). Signed with the public AOSP testkey (v1+v2+v3) — side-load only, not update-compatible with the official app."
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" "$OUT" --clobber
+          else
+            gh release create "$TAG" "$OUT" --title "BachataS4 $TAG (fork, full runtime)" --notes "$NOTES"
+          fi

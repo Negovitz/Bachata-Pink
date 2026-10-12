@@ -7,6 +7,10 @@
 #include "core/libraries/kernel/orbis_error.h"
 #include "core/libraries/kernel/posix_error.h"
 #include "core/libraries/kernel/threads/exception.h"
+#ifdef SHADPS4_ENABLE_FEX_GUEST_CPU
+#include "core/fex/fex_guest_engine.h"
+#include "core/guest_cpu/hle_call_adapter.h"
+#endif
 #include "core/libraries/kernel/threads/pthread.h"
 #include "core/libraries/libs.h"
 #include "core/signals.h"
@@ -21,6 +25,20 @@
 #include "exception.h"
 
 namespace Libraries::Kernel {
+
+#ifdef SHADPS4_ENABLE_FEX_GUEST_CPU
+// Strong definition of the hook declared (weak) in core/fex/fex_guest_engine.cpp: top of the
+// current Orbis pthread's guest stack, 16-byte aligned.
+u64 FexCurrentGuestStackTop() noexcept {
+    auto* thr = g_curthread;
+    if (thr == nullptr || thr->attr.stackaddr_attr == nullptr ||
+        thr->attr.stacksize_attr <= 0x2000) {
+        return 0;
+    }
+    const auto base = reinterpret_cast<u64>(thr->attr.stackaddr_attr);
+    return (base + thr->attr.stacksize_attr) & ~u64{0xf};
+}
+#endif
 
 #ifndef _WIN32
 Ucontext::Ucontext(siginfo_t const* inf, ucontext_t* raw_context) {
@@ -96,6 +114,10 @@ Ucontext::Ucontext(siginfo_t const* inf, ucontext_t* raw_context) {
     uc_mcontext.mc_rip = regs[REG_RIP];
     uc_mcontext.mc_addr = reinterpret_cast<uint64_t>(inf->si_addr);
 #endif
+#elif defined(SHADPS4_ENABLE_FEX_GUEST_CPU)
+    // ARM64 host running x86 guest code through FEX: the x86 register file lives in FEX's
+    // state, not in the host ucontext, so only the fault address is meaningful here.
+    uc_mcontext.mc_addr = reinterpret_cast<uint64_t>(inf->si_addr);
 #else
 #error "ucontext_t conversion not implemented for current architecture."
 #endif
@@ -219,6 +241,8 @@ void Ucontext::SyncHostFromGuest() {
     // regs[REG_CSGSFS] |= (greg_t{uc_mcontext.mc_gs} << 16);
     regs[REG_RIP] = uc_mcontext.mc_rip;
 #endif
+#elif defined(SHADPS4_ENABLE_FEX_GUEST_CPU)
+    // Guest registers are owned by FEX on ARM64 hosts; nothing to copy back to the host context.
 #else
 #error "ucontext_t conversion not implemented for current architecture."
 #endif

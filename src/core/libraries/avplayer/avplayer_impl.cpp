@@ -4,13 +4,34 @@
 #include "core/libraries/avplayer/avplayer_common.h"
 #include "core/libraries/avplayer/avplayer_error.h"
 #include "core/libraries/avplayer/avplayer_impl.h"
+#ifdef SHADPS4_ENABLE_FEX_GUEST_CPU
+#include "core/guest_cpu/guest_callback.h"
+#endif
 
 namespace Libraries::AvPlayer {
+
+#ifdef SHADPS4_ENABLE_FEX_GUEST_CPU
+template <typename Callback>
+const void* CallbackAddress(Callback callback) {
+    return reinterpret_cast<const void*>(callback);
+}
+
+template <typename Callback>
+bool IsGuestCallback(Callback callback) {
+    return Core::GuestCpu::IsGuestFunctionAddress(CallbackAddress(callback));
+}
+#endif
 
 void* PS4_SYSV_ABI AvPlayer::Allocate(void* handle, u32 alignment, u32 size) {
     const auto* const self = reinterpret_cast<AvPlayer*>(handle);
     const auto allocate = self->m_init_data_original.memory_replacement.allocate;
     const auto ptr = self->m_init_data_original.memory_replacement.object_ptr;
+#ifdef SHADPS4_ENABLE_FEX_GUEST_CPU
+    if (IsGuestCallback(allocate)) {
+        return reinterpret_cast<void*>(Core::GuestCpu::RunGuestFunctionOrAbort(
+            CallbackAddress(allocate), "AvPlayer allocate", ptr, alignment, size));
+    }
+#endif
     return allocate(ptr, alignment, size);
 }
 
@@ -18,13 +39,26 @@ void PS4_SYSV_ABI AvPlayer::Deallocate(void* handle, void* memory) {
     const auto* const self = reinterpret_cast<AvPlayer*>(handle);
     const auto deallocate = self->m_init_data_original.memory_replacement.deallocate;
     const auto ptr = self->m_init_data_original.memory_replacement.object_ptr;
-    return deallocate(ptr, memory);
+#ifdef SHADPS4_ENABLE_FEX_GUEST_CPU
+    if (IsGuestCallback(deallocate)) {
+        Core::GuestCpu::RunGuestFunctionOrAbort(CallbackAddress(deallocate),
+                                                "AvPlayer deallocate", ptr, memory);
+        return;
+    }
+#endif
+    deallocate(ptr, memory);
 }
 
 void* PS4_SYSV_ABI AvPlayer::AllocateTexture(void* handle, u32 alignment, u32 size) {
     const auto* const self = reinterpret_cast<AvPlayer*>(handle);
     const auto allocate = self->m_init_data_original.memory_replacement.allocate_texture;
     const auto ptr = self->m_init_data_original.memory_replacement.object_ptr;
+#ifdef SHADPS4_ENABLE_FEX_GUEST_CPU
+    if (IsGuestCallback(allocate)) {
+        return reinterpret_cast<void*>(Core::GuestCpu::RunGuestFunctionOrAbort(
+            CallbackAddress(allocate), "AvPlayer allocate texture", ptr, alignment, size));
+    }
+#endif
     return allocate(ptr, alignment, size);
 }
 
@@ -32,7 +66,14 @@ void PS4_SYSV_ABI AvPlayer::DeallocateTexture(void* handle, void* memory) {
     const auto* const self = reinterpret_cast<AvPlayer*>(handle);
     const auto deallocate = self->m_init_data_original.memory_replacement.deallocate_texture;
     const auto ptr = self->m_init_data_original.memory_replacement.object_ptr;
-    return deallocate(ptr, memory);
+#ifdef SHADPS4_ENABLE_FEX_GUEST_CPU
+    if (IsGuestCallback(deallocate)) {
+        Core::GuestCpu::RunGuestFunctionOrAbort(
+            CallbackAddress(deallocate), "AvPlayer deallocate texture", ptr, memory);
+        return;
+    }
+#endif
+    deallocate(ptr, memory);
 }
 
 int PS4_SYSV_ABI AvPlayer::OpenFile(void* handle, const char* filename) {
@@ -78,8 +119,19 @@ AvPlayerInitData AvPlayer::StubInitData(const AvPlayerInitData& data) {
     result.memory_replacement.deallocate = &AvPlayer::Deallocate;
     result.memory_replacement.allocate_texture = &AvPlayer::AllocateTexture;
     result.memory_replacement.deallocate_texture = &AvPlayer::DeallocateTexture;
-    if (data.file_replacement.open == nullptr || data.file_replacement.close == nullptr ||
-        data.file_replacement.read_offset == nullptr || data.file_replacement.size == nullptr) {
+    const bool missing_file_callback =
+        data.file_replacement.open == nullptr || data.file_replacement.close == nullptr ||
+        data.file_replacement.read_offset == nullptr || data.file_replacement.size == nullptr;
+#ifdef SHADPS4_ENABLE_FEX_GUEST_CPU
+    const bool has_guest_file_callback =
+        IsGuestCallback(data.file_replacement.open) ||
+        IsGuestCallback(data.file_replacement.close) ||
+        IsGuestCallback(data.file_replacement.read_offset) ||
+        IsGuestCallback(data.file_replacement.size);
+#else
+    constexpr bool has_guest_file_callback = false;
+#endif
+    if (missing_file_callback || has_guest_file_callback) {
         result.file_replacement = {};
     } else {
         result.file_replacement.object_ptr = this;

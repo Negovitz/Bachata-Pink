@@ -28,6 +28,7 @@
 #include "core/platform.h"
 #include "video_core/amdgpu/liverpool.h"
 #include "video_core/amdgpu/pm4_cmds.h"
+#include "video_core/amdgpu/stall_log.h"
 #include "video_core/renderdoc.h"
 #include "video_core/renderer_vulkan/vk_draw_trace.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
@@ -410,6 +411,13 @@ void Liverpool::Process(std::stop_token stoken) {
                 task = queue.submits.front();
             }
             task.resume();
+#ifdef ENABLE_BACHATA_RUNTIME
+            if (++debug_resume_count % 1'000 == 0) {
+                LOG_WARNING(Render_Vulkan,
+                            "GPU coroutine active resumes={} queue={} opcode={:#x} submits={}",
+                            debug_resume_count, curr_qid, debug_last_opcode, num_submits.load());
+            }
+#endif
 
             if (task.done()) {
                 task.destroy();
@@ -459,6 +467,9 @@ Liverpool::Task Liverpool::ProcessCeUpdate(std::span<const u32> ccb) {
         }
 
         const PM4ItOpcode opcode = header->type3.opcode;
+#ifdef ENABLE_BACHATA_RUNTIME
+        debug_last_opcode = static_cast<u32>(opcode);
+#endif
         const auto* it_body = reinterpret_cast<const u32*>(header) + 1;
         if (CpHistory::Enabled()) {
             CpHistory::RecordPacket(CpHistory::Queue::Ce, ccb);
@@ -495,9 +506,18 @@ Liverpool::Task Liverpool::ProcessCeUpdate(std::span<const u32> ccb) {
             break;
         }
         case PM4ItOpcode::WaitOnDeCounterDiff: {
-            const auto diff = it_body[0];
+            const u32 diff = it_body[0];
+            u64 wdecd_iters = 0;
             while ((cblock.de_count - cblock.ce_count) >= diff) {
                 YIELD_CE();
+#ifdef ENABLE_BACHATA_RUNTIME
+                if (ShouldLogStallIteration(++wdecd_iters)) {
+                    LOG_WARNING(Render_Vulkan,
+                                "PM4 WAIT_ON_DE_COUNTER_DIFF stalled (CE) iterations={} diff={} "
+                                "ce_count={} de_count={}",
+                                wdecd_iters, diff, cblock.ce_count, cblock.de_count);
+                }
+#endif
             }
             break;
         }
@@ -580,6 +600,9 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
             if (CpHistory::Enabled()) {
                 CpHistory::RecordPacket(CpHistory::Queue::De, dcb);
             }
+#ifdef ENABLE_BACHATA_RUNTIME
+            debug_last_opcode = static_cast<u32>(opcode);
+#endif
             switch (opcode) {
             case PM4ItOpcode::Nop: {
                 const auto* nop = reinterpret_cast<const PM4CmdNop*>(header);
@@ -591,7 +614,8 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 case PM4CmdNop::PayloadType::PatchedFlip: {
                     // There is no evidence that GPU CP drives flip events by parsing
                     // special NOP packets. For convenience lets assume that it does.
-                    Platform::IrqC::Instance()->Signal(Platform::InterruptId::GfxFlip);
+                    Platform::IrqC::Instance()->Signal(Platform::InterruptId::GfxFlip,
+                                                       nop->data_block[1]);
                     break;
                 }
                 case PM4CmdNop::PayloadType::DebugMarkerPush: {
@@ -1189,7 +1213,15 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 if (mem_semaphore->IsSignaling()) {
                     mem_semaphore->Signal();
                 } else {
+                    u64 sem_iters = 0;
                     while (!mem_semaphore->Signaled()) {
+#ifdef ENABLE_BACHATA_RUNTIME
+                        if (ShouldLogStallIteration(++sem_iters)) {
+                            LOG_WARNING(Render_Vulkan,
+                                        "PM4 MEM_SEMAPHORE stalled queue=gfx iterations={}",
+                                        sem_iters);
+                        }
+#endif
                         YIELD_GFX();
                     }
                     mem_semaphore->Decrement();
@@ -1212,7 +1244,14 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                     break;
                 }
                 const PM4CmdRewind* rewind = reinterpret_cast<const PM4CmdRewind*>(header);
+                u64 rewind_iters = 0;
                 while (!rewind->Valid()) {
+#ifdef ENABLE_BACHATA_RUNTIME
+                    if (ShouldLogStallIteration(++rewind_iters)) {
+                        LOG_WARNING(Render_Vulkan,
+                                    "PM4 REWIND stalled queue=gfx iterations={}", rewind_iters);
+                    }
+#endif
                     YIELD_GFX();
                 }
                 break;
@@ -1245,8 +1284,26 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                     vo_port->WaitVoLabel([&] { return wait_reg_mem->Test(regs.reg_array); });
                     break;
                 }
+                u64 wait_iterations = 0;
                 while (!CpWaitPasses(wait_reg_mem, regs.reg_array)) {
                     Common::PerfStats::Add(Common::PerfStats::Id::CpWaitYields);
+#ifdef ENABLE_BACHATA_RUNTIME
+                    if (ShouldLogStallIteration(++wait_iterations)) {
+                        const bool is_memory = wait_reg_mem->mem_space.Value() ==
+                                               PM4CmdWaitRegMem::MemSpace::Memory;
+                        const u32 value = is_memory ? *wait_reg_mem->Address<const u32*>()
+                                                    : regs.reg_array[wait_reg_mem->Reg()];
+                        LOG_WARNING(Render_Vulkan,
+                                    "PM4 WAIT_REG_MEM stalled queue=gfx iterations={} space={} "
+                                    "address={:#x} value={:#x} ref={:#x} mask={:#x} function={}",
+                                    wait_iterations, is_memory ? "memory" : "register",
+                                    is_memory ? reinterpret_cast<uintptr_t>(
+                                                    wait_reg_mem->Address<const u32*>())
+                                              : wait_reg_mem->Reg(),
+                                    value, wait_reg_mem->ref, wait_reg_mem->mask,
+                                    static_cast<u32>(wait_reg_mem->function.Value()));
+                    }
+#endif
                     YIELD_GFX();
                 }
                 break;
@@ -1257,9 +1314,16 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                     {indirect_buffer->Address<const u32>(), indirect_buffer->ib_size}, {});
                 RESUME_GFX(task);
 
+                u64 ib_iters = 0;
                 while (!task.handle.done()) {
                     YIELD_GFX();
                     RESUME_GFX(task);
+#ifdef ENABLE_BACHATA_RUNTIME
+                    if (ShouldLogStallIteration(++ib_iters)) {
+                        LOG_WARNING(Render_Vulkan,
+                                    "PM4 INDIRECT_BUFFER nested gfx stalled iterations={}", ib_iters);
+                    }
+#endif
                 }
                 break;
             }
@@ -1268,8 +1332,17 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 break;
             }
             case PM4ItOpcode::WaitOnCeCounter: {
+                u64 woce_iters = 0;
                 while (cblock.ce_count <= cblock.de_count && !ce_task.handle.done()) {
                     RESUME_GFX(ce_task);
+#ifdef ENABLE_BACHATA_RUNTIME
+                    if (ShouldLogStallIteration(++woce_iters)) {
+                        LOG_WARNING(Render_Vulkan,
+                                    "PM4 WAIT_ON_CE_COUNTER stalled queue=gfx iterations={} "
+                                    "ce_count={} de_count={} ce_task_done={}",
+                                    woce_iters, cblock.ce_count, cblock.de_count, 0);
+                    }
+#endif
                 }
                 break;
             }
@@ -1322,8 +1395,17 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
     }
 
     if (ce_task.handle) {
+        u64 cedrain_iters = 0;
         while (!ce_task.handle.done()) {
             RESUME_GFX(ce_task);
+#ifdef ENABLE_BACHATA_RUNTIME
+            if (ShouldLogStallIteration(++cedrain_iters)) {
+                LOG_WARNING(Render_Vulkan,
+                            "PM4 CE_DRAIN stalled (post-dcb ce_task) iterations={} "
+                            "ce_count={} de_count={}",
+                            cedrain_iters, cblock.ce_count, cblock.de_count);
+            }
+#endif
         }
         ce_task.handle.destroy();
     }
@@ -1393,6 +1475,9 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
         if (CpHistory::Enabled()) {
             CpHistory::RecordPacket(static_cast<s16>(vqid), acb);
         }
+#ifdef ENABLE_BACHATA_RUNTIME
+        debug_last_opcode = static_cast<u32>(opcode);
+#endif
 
         const auto* it_body = reinterpret_cast<const u32*>(header) + 1;
         switch (opcode) {
@@ -1610,8 +1695,26 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
                         u32(wait_reg_mem->function.Value()), wait_reg_mem->ref,
                         wait_reg_mem->mask, wait_reg_mem->Test(regs.reg_array));
             }
+            u64 wait_iterations = 0;
             while (!CpWaitPasses(wait_reg_mem, regs.reg_array)) {
                 Common::PerfStats::Add(Common::PerfStats::Id::CpWaitYields);
+#ifdef ENABLE_BACHATA_RUNTIME
+                if (ShouldLogStallIteration(++wait_iterations)) {
+                    const bool is_memory = wait_reg_mem->mem_space.Value() ==
+                                           PM4CmdWaitRegMem::MemSpace::Memory;
+                    const u32 value = is_memory ? *wait_reg_mem->Address<const u32*>()
+                                                : regs.reg_array[wait_reg_mem->Reg()];
+                    LOG_WARNING(Render_Vulkan,
+                                "PM4 WAIT_REG_MEM stalled queue=asc{} iterations={} space={} "
+                                "address={:#x} value={:#x} ref={:#x} mask={:#x} function={}",
+                                vqid, wait_iterations, is_memory ? "memory" : "register",
+                                is_memory ? reinterpret_cast<uintptr_t>(
+                                                wait_reg_mem->Address<const u32*>())
+                                          : wait_reg_mem->Reg(),
+                                value, wait_reg_mem->ref, wait_reg_mem->mask,
+                                static_cast<u32>(wait_reg_mem->function.Value()));
+                }
+#endif
                 YIELD_ASC(vqid);
             }
             break;
@@ -1696,10 +1799,29 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
 
 Liverpool::CmdBuffer Liverpool::CopyCmdBuffers(std::span<const u32> dcb, std::span<const u32> ccb) {
     auto& queue = mapped_queues[GfxQueueId];
-    ASSERT_MSG(queue.dcb_buffer.capacity() >= queue.dcb_buffer_offset + dcb.size(),
-               "dcb copy buffer out of reserved space");
-    ASSERT_MSG(queue.ccb_buffer.capacity() >= queue.ccb_buffer_offset + ccb.size(),
-               "ccb copy buffer out of reserved space");
+
+    // A single submission must always fit the reserved copy space.
+    ASSERT_MSG(dcb.size() <= queue.dcb_buffer.capacity(),
+               "dcb submission larger than reserved copy space");
+    ASSERT_MSG(ccb.size() <= queue.ccb_buffer.capacity(),
+               "ccb submission larger than reserved copy space");
+
+    // The copy buffers persist across submissions so the GPU worker can parse a
+    // command buffer even after the guest reuses its source ring. Their offsets
+    // therefore grow monotonically and are only reset once the buffered data is no
+    // longer needed. The guest is expected to signal that point with
+    // sceGnmSubmitDone (-> SubmitDone), but some titles (e.g. Dark Souls
+    // Remastered) never call it, so the offset would otherwise overflow the
+    // reserved space and trip the assert below. When the next append would exceed
+    // the reservation, drain the GPU first (all previously buffered spans have
+    // then been consumed and can be discarded) and rewind the offsets to zero.
+    const bool dcb_overflows = queue.dcb_buffer_offset + dcb.size() > queue.dcb_buffer.capacity();
+    const bool ccb_overflows = queue.ccb_buffer_offset + ccb.size() > queue.ccb_buffer.capacity();
+    if (dcb_overflows || ccb_overflows) {
+        WaitGpuIdle();
+        queue.dcb_buffer_offset = 0;
+        queue.ccb_buffer_offset = 0;
+    }
 
     queue.dcb_buffer.resize(
         std::max(queue.dcb_buffer.size(), queue.dcb_buffer_offset + dcb.size()));

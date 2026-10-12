@@ -7,6 +7,7 @@
 #include "core/libraries/error_codes.h"
 #include "core/libraries/libs.h"
 #include "libc_internal.h"
+#include "libc_internal_cxa.h"
 #include "libc_internal_io.h"
 #include "libc_internal_math.h"
 #include "libc_internal_memory.h"
@@ -24,4 +25,14 @@ void RegisterLib(Core::Loader::SymbolsResolver* sym) {
     RegisterlibSceLibcInternalThreads(sym);
 }
 
+void ForceRegisterLib(Core::Loader::SymbolsResolver* sym) {
+    // Used to forcibly enable HLEs for broken LLE functions.
+    ForceRegisterlibSceLibcInternalIo(sym);
+#ifdef SHADPS4_ENABLE_FEX_GUEST_CPU
+    RegisterFexLibcMemoryAliases(sym);
+    RegisterFexLibcMathAliases(sym);
+    RegisterFexLibcStrAliases(sym);
+    RegisterFexLibcCxaAliases(sym);
+#endif
+}
 } // namespace Libraries::LibcInternal

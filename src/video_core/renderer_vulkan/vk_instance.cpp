@@ -183,9 +183,13 @@ Instance::Instance(Frontend::WindowSDL& window, s32 physical_device_index,
                VK_VERSION_MAJOR(properties.apiVersion), VK_VERSION_MINOR(properties.apiVersion));
 
     CreateDevice();
+    std::fprintf(stderr, "BACHATA_INSTANCE_DEVICE_READY\n");
     CollectPhysicalMemoryInfo();
+    std::fprintf(stderr, "BACHATA_INSTANCE_MEMORY_READY\n");
     CollectImageFormatInfo();
+    std::fprintf(stderr, "BACHATA_INSTANCE_FORMATS_READY\n");
     CollectToolingInfo();
+    std::fprintf(stderr, "BACHATA_INSTANCE_READY\n");
 }
 
 Instance::~Instance() {
@@ -259,11 +263,14 @@ bool Instance::CreateDevice() {
     // Required
     ASSERT_MSG(add_extension(VK_KHR_SWAPCHAIN_EXTENSION_NAME),
                "Required Vulkan extension unavailable: {}", VK_KHR_SWAPCHAIN_EXTENSION_NAME);
-    ASSERT_MSG(add_extension(VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME),
-               "Required Vulkan extension unavailable: {}", VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME);
-    ASSERT_MSG(add_extension(VK_EXT_VERTEX_ATTRIBUTE_DIVISOR_EXTENSION_NAME),
-               "Required Vulkan extension unavailable: {}",
-               VK_EXT_VERTEX_ATTRIBUTE_DIVISOR_EXTENSION_NAME);
+    // VK_KHR_push_descriptor is optional on Mali/Immortalis drivers. When unavailable,
+    // push_descriptor_props stays zero-initialized (MaxPushDescriptors()==0) and all
+    // descriptor-set layouts fall back to the non-push path with a DescriptorHeap.
+    push_descriptor = add_extension(VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME);
+    // VK_EXT_vertex_attribute_divisor is also optional. When unavailable, instanced
+    // (step-rate) vertex fetch silently degrades to per-vertex (divisor=1). Per-vertex
+    // attributes are unaffected. Mali/Immortalis drivers do not expose this extension.
+    vertex_attribute_divisor = add_extension(VK_EXT_VERTEX_ATTRIBUTE_DIVISOR_EXTENSION_NAME);
     ASSERT_MSG(add_extension(VK_EXT_ROBUSTNESS_2_EXTENSION_NAME),
                "Required Vulkan extension unavailable: {}", VK_EXT_ROBUSTNESS_2_EXTENSION_NAME);
 
@@ -637,6 +644,9 @@ bool Instance::CreateDevice() {
     if (!maintenance_5) {
         device_chain.unlink<vk::PhysicalDeviceMaintenance5FeaturesKHR>();
     }
+    if (!vertex_attribute_divisor) {
+        device_chain.unlink<vk::PhysicalDeviceVertexAttributeDivisorFeatures>();
+    }
     if (!maintenance_8) {
         device_chain.unlink<vk::PhysicalDeviceMaintenance8FeaturesKHR>();
     }
@@ -674,6 +684,67 @@ bool Instance::CreateDevice() {
     device = std::move(dev);
 
     VULKAN_HPP_DEFAULT_DISPATCHER.init(*device);
+
+
+    // ── Vulkan 1.3 dispatch audit ─────────────────────────────────────────────
+    // Run immediately after init(*device) so failures surface at startup, not at
+    // the first draw call.  If any mandatory slot is null the renderer cannot
+    // proceed; log every slot so the complete state is captured in one message.
+#ifndef NDEBUG
+    {
+        struct SlotCheck {
+            const char* name;
+            const void* slot;  // address stored in the dispatcher
+            bool required;
+        };
+        auto gdpa = VULKAN_HPP_DEFAULT_DISPATCHER.vkGetDeviceProcAddr;
+        VkDevice raw_device = static_cast<VkDevice>(*device);
+
+        // Probe each function via GDPA so we can compare direct vs. Vulkan-Hpp slot.
+#define PROBE(fn)                                                            \
+        {                                                                    \
+            #fn,                                                             \
+            reinterpret_cast<const void*>(VULKAN_HPP_DEFAULT_DISPATCHER.fn),\
+            true                                                             \
+        }
+        const SlotCheck checks[] = {
+            PROBE(vkCmdBindVertexBuffers2),
+            PROBE(vkCmdPipelineBarrier2),
+            PROBE(vkQueueSubmit2),
+            PROBE(vkCmdBeginRendering),
+            PROBE(vkCmdEndRendering),
+            PROBE(vkCmdCopyBuffer2),
+            PROBE(vkCmdCopyImage2),
+            PROBE(vkCmdCopyBufferToImage2),
+            PROBE(vkCmdCopyImageToBuffer2),
+            PROBE(vkCmdBlitImage2),
+            PROBE(vkCmdResolveImage2),
+            PROBE(vkGetBufferDeviceAddress),
+        };
+#undef PROBE
+
+        bool any_null = false;
+        LOG_INFO(Render_Vulkan,
+                 "VK-HPP dispatch audit: dispatcher={} device={}",
+                 fmt::ptr(&VULKAN_HPP_DEFAULT_DISPATCHER),
+                 fmt::ptr(raw_device));
+        for (const auto& c : checks) {
+            auto direct = gdpa ? gdpa(raw_device, c.name) : nullptr;
+            LOG_INFO(Render_Vulkan,
+                     "  {:40s} hpp={} direct={}{}",
+                     c.name,
+                     fmt::ptr(c.slot),
+                     fmt::ptr(direct),
+                     (c.required && !c.slot) ? " <-- NULL MANDATORY SLOT" : "");
+            if (c.required && !c.slot)
+                any_null = true;
+        }
+        ASSERT_MSG(!any_null,
+                   "One or more mandatory Vulkan 1.3 dispatcher slots are null "
+                   "immediately after init(*device). Renderer cannot start.");
+    }
+#endif
+
 
     graphics_queue = device->getQueue(queue_family_index, 0);
     present_queue = device->getQueue(queue_family_index, 0);
@@ -825,6 +896,12 @@ void Instance::CollectImageFormatInfo() {
     LOG_INFO(Render_Vulkan, "Block Texel View support: {}",
              supports_block_texel_view ? "Yes" : "No");
 
+#ifdef ENABLE_BACHATA_RUNTIME
+    // Remaining checks only produce diagnostics. Some Turnip format-property paths block when
+    // reached through Box64, while format support is already cached for renderer decisions.
+    return;
+#endif
+
     // Check and log format support details.
     for (const auto& format : LiverpoolToVK::SurfaceFormats()) {
         if (!IsFormatSupported(format.vk_format, format.flags)) {
@@ -849,6 +926,11 @@ void Instance::CollectImageFormatInfo() {
 }
 
 void Instance::CollectToolingInfo() const {
+#ifdef ENABLE_BACHATA_RUNTIME
+    // Turnip's tool-properties query can block indefinitely through Box64. Tool metadata is
+    // diagnostic-only and is not required for device creation or rendering.
+    return;
+#endif
     if (driver_id == vk::DriverId::eAmdProprietary ||
         driver_id == vk::DriverId::eIntelProprietaryWindows) {
         // AMD: Causes issues with Reshade.
