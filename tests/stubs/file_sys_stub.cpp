@@ -17,7 +17,7 @@ std::optional<std::vector<u8>> ReadGameFile(const std::filesystem::path& game_ro
                                             std::string_view rel_path) {
     std::error_code ec;
     if (!std::filesystem::is_directory(game_root, ec) || ec) {
-        // Archive-backed roots need the real backend,not available in tests.
+        // Archive-backed roots need the real backend, which these tests do not provide
         return std::nullopt;
     }
 

@@ -3,12 +3,17 @@
 
 #pragma once
 
+#include <array>
+#include <atomic>
 #include <condition_variable>
+#include <memory>
+#include <deque>
 #include <mutex>
 #include <thread>
 #include <queue>
 
 #include "common/interval_set.h"
+#include "common/perf_stats.h"
 #include "common/unique_function.h"
 #include "video_core/amdgpu/regs_color.h"
 #include "video_core/amdgpu/regs_primitive.h"
@@ -23,6 +28,7 @@ class VkCtxScope;
 namespace Vulkan {
 
 class Instance;
+class CommandRecorder;
 
 struct RenderAttachment {
     vk::ImageView image_view;
@@ -352,7 +358,10 @@ using SubmitFunc = Common::UniqueFunction<void, SubmitInfo&>;
 
 class Scheduler {
 public:
-    explicit Scheduler(const Instance& instance);
+    /// Send Vulkan commands and submits through record_thread when cp_record_thread is enabled
+    /// CommandBuffer returns fake handles for that path, with their lifetime managed by the
+    /// recorder described in vk_recorder.h
+    explicit Scheduler(const Instance& instance, bool record_thread = false);
     ~Scheduler();
 
     /// Sends the current execution context to the GPU
@@ -366,11 +375,55 @@ public:
     /// Sends the current execution context to the GPU and waits for it to complete.
     void Finish();
 
+    /// Finish a readback once its GPU marker arrives in wait_marker mode 2, even if the driver has
+    /// not reported the submit yet
+    /// Keep the known GPU tick unchanged until the driver confirms it so resource reuse still
+    /// follows the timeline
+    void FinishHostRead();
+
     /// Waits for the given tick to trigger on the GPU.
     void Wait(u64 tick);
 
+    /// Idea B (readback_ahead): begins a command buffer that SubmitAhead() sends ahead of the current one, on
+    /// the same queue. It runs after every earlier submission but before the commands recorded so far, which
+    /// stay open. Only one can be in flight: the caller waits with WaitAhead() before the next
+    [[nodiscard]] vk::CommandBuffer BeginAhead();
+
+    /// Submits the ahead command buffer after its latest writer
+    void SubmitAhead(u64 wait_tick);
+
+    /// Waits for the command buffer sent by SubmitAhead(). `writers_done`: the copied bytes had no writer
+    /// still running, so the wait is only the copy and the submit latency (perf counters)
+    void WaitAhead(bool writers_done);
+
     /// Attempts to execute operations whose tick the GPU has caught up with.
     void PopPendingOperations();
+
+    /// Run a queue operation such as a sparse bind in submission order, either immediately or on
+    /// the recording thread under submit_mutex
+    /// Immediate callers already hold that mutex through the submit callback
+    void RunOnQueue(Common::UniqueFunction<void>&& func);
+
+    /// Wait until tick has actually reached the queue before any host wait, marker poll or
+    /// dependent submit from another queue
+    /// A tick closed by the command processor may still be waiting on the recording thread
+    /// Any thread can call this, and it does nothing when recording runs directly
+    /// Check submission before starting those waits so no caller relies on a signal that has not
+    /// been queued yet
+    void WaitSubmitted(u64 tick);
+
+    /// Wait until the cp_record_thread recorder has run all queued operations so later work can use
+    /// their results or safely change ownership
+    void SyncRecorder();
+
+    /// Let the calling thread take over recording on this scheduler when shutdown changes threads
+    /// The previous thread must have stopped recording before this handover so only one producer
+    /// writes to the command stream
+    void ClaimRecorder();
+
+    [[nodiscard]] bool IsRecorded() const noexcept {
+        return recording;
+    }
 
     /// Starts a new rendering scope with provided state.
     void BeginRendering(const RenderState& new_state);
@@ -394,6 +447,19 @@ public:
         this->on_submit = std::move(on_submit);
     }
 
+    /// Returns true inside a render pass
+    [[nodiscard]] bool IsRendering() const noexcept {
+        return is_rendering;
+    }
+
+    /// Counts guest commands recorded since the last submit
+    void CountRecordedCommand() noexcept {
+        ++commands_since_submit;
+    }
+    [[nodiscard]] u32 CommandsSinceSubmit() const noexcept {
+        return commands_since_submit;
+    }
+
     /// Returns the current render state.
     const RenderState& GetRenderState() const {
         return render_state;
@@ -407,6 +473,28 @@ public:
     /// Returns the current command buffer.
     vk::CommandBuffer CommandBuffer() const {
         return sessions.back().primary;
+    }
+
+    /// Binds a pipeline and skips duplicates when enabled
+    void BindPipeline(vk::PipelineBindPoint point, vk::Pipeline pipeline) {
+        auto& bound = bound_pipelines[point == vk::PipelineBindPoint::eCompute ? 1 : 0];
+        if (skip_redundant_binds && bound == pipeline &&
+            Common::PerfStats::AbToggleOn(skip_binds_toggle)) {
+            Common::PerfStats::Add(Common::PerfStats::Id::PipelineBindsSkipped);
+            return;
+        }
+        bound = pipeline;
+        CommandBuffer().bindPipeline(point, pipeline);
+    }
+
+    /// Clears tracked binds after a direct pipeline bind
+    void InvalidatePipelineBinds() noexcept {
+        bound_pipelines = {};
+    }
+
+    void SkipRedundantPipelineBinds(bool enable) noexcept {
+        skip_redundant_binds = enable;
+        skip_binds_toggle = Common::PerfStats::AbToggleFollows("gpu_overhead_cuts");
     }
 
     /// Returns the current command buffer tick.
@@ -445,14 +533,43 @@ public:
         priority_pending_ops_cv.notify_one();
     }
 
+    /// gpu_checkpoints: attributes GPU checkpoint records to this scheduler's submits (see
+    /// vk_gpu_checkpoints.h). Called once, for the rasterizer's scheduler
+    void TrackGpuCommands() noexcept {
+        tracks_gpu_commands = true;
+    }
+
+    /// SHADPS4_PERF_STATS: measures the GPU execution time of every submit with a pair of timestamps and
+    /// reports it as gpu_ms. Called once, for the rasterizer's scheduler
+    void EnableGpuTiming();
+
     static std::mutex submit_mutex;
 
 private:
-    void EndSession();
+    /// Ends the current session. submit_tick is the timeline value of the submit that carries it, or 0 when a
+    /// new session starts inside the same submit
+    void EndSession(u64 submit_tick = 0);
 
     void SubmitExecution(SubmitInfo& info);
 
+    /// Prepare SubmitExecution on the calling thread and queue its actual submit on the recording
+    /// thread after the recorded commands
+    void SubmitRecorded(SubmitInfo& info);
+
+    /// Allocate and begin the real command buffer on the recording thread, then connect it with the
+    /// fake handle used by the producer
+    void BeginRecorded(vk::CommandBuffer fake);
+
+    /// Choose the next submit mode from cp_record_thread and the current SHADPS4_AB_TOGGLE interval
+    /// Drain the recording thread before returning to real handles so it can hand the command pool
+    /// back safely
+    void SelectRecordingMode();
+
     void PriorityPendingOpsThread(std::stop_token stoken);
+
+    void BeginGpuTiming();
+    void EndGpuTiming(u64 submit_tick);
+    void CollectGpuTiming();
 
 private:
     const Instance& instance;
@@ -480,6 +597,53 @@ private:
     RenderState render_state;
     bool is_rendering = false;
     tracy::VkCtxScope* profiler_scope{};
+
+    bool tracks_gpu_commands{};
+    // Pipelines bound to the current command buffer (graphics, compute), for BindPipeline
+    std::array<vk::Pipeline, 2> bound_pipelines{};
+    bool skip_redundant_binds{};
+    bool skip_binds_toggle{};
+    u64 submitted_seq{};
+    u32 commands_since_submit{};
+
+    static constexpr u32 GpuTimingSlots = 256;
+    struct GpuTimingPending {
+        u32 slot;
+        u64 tick;
+    };
+    vk::UniqueQueryPool gpu_timing_pool;
+    std::deque<GpuTimingPending> gpu_timing_pending;
+    std::array<bool, GpuTimingSlots> gpu_timing_busy{};
+    u32 gpu_timing_next{};
+    s32 gpu_timing_open{-1};
+    double gpu_timestamp_period_ns{};
+
+    struct AheadSlot {
+        vk::UniqueCommandPool pool;
+        vk::CommandBuffer cmdbuf;
+    };
+    /// Ahead command buffers for graphics and transfer queues
+    std::array<AheadSlot, 2> ahead_slots;
+    vk::CommandBuffer ahead_cmdbuf;
+    bool ahead_on_transfer{};
+    vk::UniqueFence ahead_fence;
+    u32 ahead_seq{}; ///< Number of ahead submits so far, written into the Ahead marker slot by each copy submission
+    bool ahead_unconfirmed{}; ///< Whether WaitAhead returned on the mode 2 marker while its fence may still need a driver
+///< confirmation
+    u64 ahead_submits{}; // gpu_checkpoints: numbers the ahead submits in the submit ledger
+    const u32 wait_spin_us;
+
+    /// Keep the newest tick already submitted to the queue, whether by the recorder or directly
+    /// during an interval with the setting off under SHADPS4_AB_TOGGLE
+    std::atomic<u64> recorded_submit_tick{0};
+    /// Remember whether this submit records its command buffers on the recording thread
+    /// Choose that mode at the first session and keep it for the whole submit, including
+    /// SHADPS4_AB_TOGGLE runs
+    bool recording{};
+    bool record_toggle{};
+    /// Keep this as the last member so it is destroyed first and drains its pending work while the
+    /// command pool is still alive
+    std::unique_ptr<CommandRecorder> recorder;
 };
 
 } // namespace Vulkan

@@ -697,7 +697,10 @@ struct PM4CmdWaitRegMem {
     }
 
     bool Test(std::span<const u32> regs) const {
-        u32 value = mem_space.Value() == MemSpace::Memory ? *Address() : regs[Reg()];
+        return TestValue(mem_space.Value() == MemSpace::Memory ? *Address() : regs[Reg()]);
+    }
+
+    bool TestValue(u32 value) const {
         switch (function.Value()) {
         case Function::Always: {
             return true;
@@ -1212,6 +1215,27 @@ struct PM4CmdMemSemaphore {
         default:
             UNREACHABLE_MSG("Unknown signal type {}", static_cast<u32>(signal_type.Value()));
         }
+    }
+};
+
+/// IT_GET_LOD_STATS: copies the texture LOD counters (one 64-bit entry per T# counter_bank_id) to memory.
+/// Layout as emitted by the Gnm builder of Shadow of the Colossus: the buffer size minus 32 bytes, then the
+/// 64-byte aligned address split into bits 6..37 and 38..39
+struct PM4CmdGetLodStats {
+    PM4Type3Header header;
+    u32 bu_size;
+    u32 base_lo;
+    union {
+        BitField<0, 2, u32> base_hi;
+        u32 control;
+    };
+
+    u32 NumBytes() const {
+        return bu_size + 32;
+    }
+
+    VAddr Address() const {
+        return (VAddr{base_lo} << 6) | (VAddr{base_hi.Value()} << 38);
     }
 };
 

@@ -1,20 +1,31 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <bit>
+#include <cstdlib>
+#include <mutex>
+#include <optional>
 #include <boost/container/static_vector.hpp>
 #include <fmt/format.h>
 #include <fmt/ranges.h>
 
 #include "common/assert.h"
 #include "common/debug.h"
+#include "common/logging/events.h"
 #include "common/types.h"
+#include "core/emulator_settings.h"
 #include "imgui/renderer/imgui_core.h"
 #include "sdl_window.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
+#include "video_core/renderer_vulkan/vk_gpu_checkpoints.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_platform.h"
 
 #include <vk_mem_alloc.h>
+
+#ifdef _WIN32
+#include <windows.h>
+#endif
 
 namespace Vulkan {
 
@@ -210,7 +221,8 @@ bool Instance::CreateDevice() {
         vk::PhysicalDevicePrimitiveTopologyListRestartFeaturesEXT,
         vk::PhysicalDeviceShaderAtomicFloat2FeaturesEXT,
         vk::PhysicalDeviceWorkgroupMemoryExplicitLayoutFeaturesKHR,
-        vk::PhysicalDeviceImage2DViewOf3DFeaturesEXT, vk::PhysicalDeviceShaderClockFeaturesKHR>();
+        vk::PhysicalDeviceImage2DViewOf3DFeaturesEXT, vk::PhysicalDeviceShaderClockFeaturesKHR,
+        vk::PhysicalDeviceFaultFeaturesEXT>();
     features = feature_chain.get().features;
 
     const vk::StructureChain properties_chain = physical_device.getProperties2<
@@ -228,7 +240,7 @@ bool Instance::CreateDevice() {
         return false;
     }
 
-    boost::container::static_vector<const char*, 32> enabled_extensions;
+    boost::container::static_vector<const char*, 64> enabled_extensions;
     const auto add_extension = [&](std::string_view extension) -> bool {
         const auto result =
             std::find_if(available_extensions.begin(), available_extensions.end(),
@@ -352,6 +364,30 @@ bool Instance::CreateDevice() {
     }
     const bool calibrated_timestamps =
         TRACY_GPU_ENABLED ? add_extension(VK_EXT_CALIBRATED_TIMESTAMPS_EXTENSION_NAME) : false;
+    // Device loss diagnostics: the fault report names the faulting address when the driver knows it (see
+    // ReportDeviceFault)
+    device_fault = add_extension(VK_EXT_DEVICE_FAULT_EXTENSION_NAME) &&
+                   feature_chain.get<vk::PhysicalDeviceFaultFeaturesEXT>().deviceFault;
+#ifdef _WIN32
+    // DLSS Neural Rendering runs on a D3D12 device of the same GPU and shares the frame and a
+    // fence with it
+    d3d12_interop = add_extension("VK_KHR_external_memory_win32") &&
+                    add_extension("VK_KHR_external_semaphore_win32");
+#endif
+    // Per-game gpu_checkpoints: the host command ring and submit ledger work on any GPU; NVIDIA queue
+    // checkpoints also name the command that was executing. Automatic driver checkpoints would replace the
+    // emulator's own markers, so the diagnostics config only enables resource tracking and shader error
+    // reporting
+    if (EmulatorSettings.IsGpuCheckpoints()) {
+        GpuCheckpoints::g_enabled = true;
+        nv_diagnostic_checkpoints =
+            add_extension(VK_NV_DEVICE_DIAGNOSTIC_CHECKPOINTS_EXTENSION_NAME);
+        nv_diagnostics_config = add_extension(VK_NV_DEVICE_DIAGNOSTICS_CONFIG_EXTENSION_NAME);
+        GpuCheckpoints::g_nv_markers = nv_diagnostic_checkpoints;
+        LOG_WARNING(Render_Vulkan,
+                    "GPU checkpoints enabled: command ring and submit ledger, NV checkpoints {}",
+                    nv_diagnostic_checkpoints ? "on" : "unsupported");
+    }
 
     const auto family_properties = physical_device.getQueueFamilyProperties();
     if (family_properties.empty()) {
@@ -374,19 +410,56 @@ bool Instance::CreateDevice() {
     }
 
     static constexpr std::array queue_priorities = {1.0f};
-    const vk::DeviceQueueCreateInfo queue_info = {
+    std::array<vk::DeviceQueueCreateInfo, 2> queue_infos{};
+    queue_infos[0] = {
         .queueFamilyIndex = queue_family_index,
         .queueCount = static_cast<u32>(queue_priorities.size()),
         .pQueuePriorities = queue_priorities.data(),
     };
+    u32 queue_info_count = 1;
+    // readback_ahead_transfer_queue: a family with transfer and nothing else (sparse binding and protected
+    // aside) is the copy engine, which runs beside the graphics queue instead of timeslicing with it. Video
+    // and optical-flow families may also expose transfer, on a slower engine
+    std::optional<u32> transfer_family;
+    if (EmulatorSettings.IsReadbackAhead() && EmulatorSettings.IsReadbackAheadTransferQueue()) {
+        constexpr vk::QueueFlags allowed = vk::QueueFlagBits::eTransfer |
+                                           vk::QueueFlagBits::eSparseBinding |
+                                           vk::QueueFlagBits::eProtected;
+        for (std::size_t i = 0; i < family_properties.size(); i++) {
+            const auto flags = family_properties[i].queueFlags;
+            if ((flags & vk::QueueFlagBits::eTransfer) && !(flags & ~allowed)) {
+                transfer_family = static_cast<u32>(i);
+                break;
+            }
+        }
+        if (transfer_family) {
+            queue_infos[queue_info_count++] = {
+                .queueFamilyIndex = *transfer_family,
+                .queueCount = 1,
+                .pQueuePriorities = queue_priorities.data(),
+            };
+        } else {
+            LOG_WARNING(Render_Vulkan, "readback_ahead_transfer_queue: the device has no transfer-only "
+                                       "queue family, so the key has no effect");
+        }
+    } else if (EmulatorSettings.IsReadbackAheadTransferQueue()) {
+        LOG_WARNING(Render_Vulkan, "readback_ahead_transfer_queue without readback_ahead: there are no "
+                                   "ahead copies to move, so the key has no effect");
+    }
+
+    if (!features.drawIndirectFirstInstance) {
+        // Guest draw arguments may use a non-zero first instance
+        LOG_WARNING(Render_Vulkan, "drawIndirectFirstInstance unsupported; indirect draws with a "
+                                   "non-zero first instance are undefined");
+    }
 
     const auto vk11_features = feature_chain.get<vk::PhysicalDeviceVulkan11Features>();
     vk12_features = feature_chain.get<vk::PhysicalDeviceVulkan12Features>();
     vk13_features = feature_chain.get<vk::PhysicalDeviceVulkan13Features>();
     vk::StructureChain device_chain = {
         vk::DeviceCreateInfo{
-            .queueCreateInfoCount = 1u,
-            .pQueueCreateInfos = &queue_info,
+            .queueCreateInfoCount = queue_info_count,
+            .pQueueCreateInfos = queue_infos.data(),
             .enabledExtensionCount = static_cast<u32>(enabled_extensions.size()),
             .ppEnabledExtensionNames = enabled_extensions.data(),
         },
@@ -401,6 +474,7 @@ bool Instance::CreateDevice() {
                 .dualSrcBlend = features.dualSrcBlend,
                 .logicOp = features.logicOp,
                 .multiDrawIndirect = features.multiDrawIndirect,
+                .drawIndirectFirstInstance = features.drawIndirectFirstInstance,
                 .depthClamp = features.depthClamp,
                 .depthBiasClamp = features.depthBiasClamp,
                 .fillModeNonSolid = features.fillModeNonSolid,
@@ -413,6 +487,9 @@ bool Instance::CreateDevice() {
                 .shaderImageGatherExtended = features.shaderImageGatherExtended,
                 .shaderStorageImageExtendedFormats = features.shaderStorageImageExtendedFormats,
                 .shaderStorageImageMultisample = features.shaderStorageImageMultisample,
+                // Descriptor arrays of dynamic_tsharp_array_size
+                .shaderSampledImageArrayDynamicIndexing =
+                    features.shaderSampledImageArrayDynamicIndexing,
                 .shaderClipDistance = features.shaderClipDistance,
                 .shaderFloat64 = features.shaderFloat64,
                 .shaderInt64 = features.shaderInt64,
@@ -523,6 +600,14 @@ bool Instance::CreateDevice() {
         vk::PhysicalDeviceShaderClockFeaturesKHR{
             .shaderSubgroupClock = shader_clock_features.shaderSubgroupClock,
         },
+        vk::PhysicalDeviceFaultFeaturesEXT{
+            .deviceFault = true,
+            .deviceFaultVendorBinary = false,
+        },
+        vk::DeviceDiagnosticsConfigCreateInfoNV{
+            .flags = vk::DeviceDiagnosticsConfigFlagBitsNV::eEnableResourceTracking |
+                     vk::DeviceDiagnosticsConfigFlagBitsNV::eEnableShaderErrorReporting,
+        },
     };
 
     if (!custom_border_color) {
@@ -574,6 +659,12 @@ bool Instance::CreateDevice() {
     if (!shader_clock) {
         device_chain.unlink<vk::PhysicalDeviceShaderClockFeaturesKHR>();
     }
+    if (!device_fault) {
+        device_chain.unlink<vk::PhysicalDeviceFaultFeaturesEXT>();
+    }
+    if (!nv_diagnostics_config) {
+        device_chain.unlink<vk::DeviceDiagnosticsConfigCreateInfoNV>();
+    }
 
     auto [device_result, dev] = physical_device.createDeviceUnique(device_chain.get());
     if (device_result != vk::Result::eSuccess) {
@@ -586,6 +677,14 @@ bool Instance::CreateDevice() {
 
     graphics_queue = device->getQueue(queue_family_index, 0);
     present_queue = device->getQueue(queue_family_index, 0);
+    if (transfer_family) {
+        transfer_queue = device->getQueue(*transfer_family, 0);
+        transfer_queue_family_index = *transfer_family;
+        LOG_WARNING(Render_Vulkan,
+                    "Workaround readback_ahead_transfer_queue enabled: readback-ahead copies use "
+                    "queue family {}",
+                    *transfer_family);
+    }
 
     if (calibrated_timestamps) {
         const auto [time_domains_result, time_domains] =
@@ -756,6 +855,10 @@ void Instance::CollectToolingInfo() const {
         // Intel: Causes crash on start.
         return;
     }
+    if (std::getenv("ENABLE_VK_LAYER_NV_nsight_sys")) {
+        // Nsight Systems 2024.6 layer: access violation inside ToolsInjection64.dll on start
+        return;
+    }
     const auto [tools_result, tools] = physical_device.getToolProperties();
     if (tools_result != vk::Result::eSuccess) {
         LOG_ERROR(Render_Vulkan, "Could not get Vulkan tool properties: {}",
@@ -826,6 +929,137 @@ vk::Format Instance::GetSupportedFormat(const vk::Format format,
         }
     }
     return format;
+}
+
+#ifdef _WIN32
+// After a device loss the driver may fault while serving these queries; keep the report alive
+static bool TryGetCheckpointsNV(VkQueue queue, u32* count, VkCheckpointDataNV* data) {
+    __try {
+        VULKAN_HPP_DEFAULT_DISPATCHER.vkGetQueueCheckpointDataNV(queue, count, data);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+#else
+static bool TryGetCheckpointsNV(VkQueue queue, u32* count, VkCheckpointDataNV* data) {
+    VULKAN_HPP_DEFAULT_DISPATCHER.vkGetQueueCheckpointDataNV(queue, count, data);
+    return true;
+}
+#endif
+
+void Instance::ReportGpuCheckpoints(const char* where) const {
+    if (!GpuCheckpoints::Enabled()) {
+        return;
+    }
+    GpuCheckpoints::DumpRecent(where);
+    GpuCheckpoints::DumpSubmits(
+        where,
+        [this](u64 semaphore, u64& counter) {
+            const auto [result, value] = device->getSemaphoreCounterValue(
+                vk::Semaphore{std::bit_cast<VkSemaphore>(semaphore)});
+            if (result != vk::Result::eSuccess) {
+                return false;
+            }
+            counter = value;
+            return true;
+        },
+        [this](u64 fence) -> std::optional<bool> {
+            const vk::Result result =
+                device->getFenceStatus(vk::Fence{std::bit_cast<VkFence>(fence)});
+            if (result != vk::Result::eSuccess && result != vk::Result::eNotReady) {
+                return std::nullopt;
+            }
+            return result == vk::Result::eSuccess;
+        });
+    if (!nv_diagnostic_checkpoints) {
+        return;
+    }
+    static constexpr u32 MaxCaptured = 512;
+    static VkCheckpointDataNV checkpoints[MaxCaptured];
+    u32 count = 0;
+    const auto queue = static_cast<VkQueue>(graphics_queue);
+    if (!TryGetCheckpointsNV(queue, &count, nullptr)) {
+        LOG_CRITICAL(Render_Vulkan, "Checkpoint count query faulted ({})", where);
+        return;
+    }
+    LOG_CRITICAL(Render_Vulkan, "=== {} queue checkpoints pending ({}) ===", count, where);
+    count = std::min(count, MaxCaptured);
+    for (u32 i = 0; i < count; ++i) {
+        checkpoints[i].sType = VK_STRUCTURE_TYPE_CHECKPOINT_DATA_NV;
+        checkpoints[i].pNext = nullptr;
+    }
+    if (count > 0 && !TryGetCheckpointsNV(queue, &count, checkpoints)) {
+        LOG_CRITICAL(Render_Vulkan, "Checkpoint data query faulted ({})", where);
+        return;
+    }
+    for (u32 i = 0; i < count; ++i) {
+        const auto stage = vk::to_string(vk::PipelineStageFlagBits(checkpoints[i].stage));
+        if (const auto* record = GpuCheckpoints::FromMarker(checkpoints[i].pCheckpointMarker)) {
+            const std::string prefix = fmt::format("checkpoint[{}] stage={} ->", i, stage);
+            GpuCheckpoints::LogRecord(prefix.c_str(), *record);
+        } else {
+            LOG_CRITICAL(Render_Vulkan, "checkpoint[{}] stage={} foreign marker {}", i, stage,
+                         checkpoints[i].pCheckpointMarker);
+        }
+    }
+}
+
+void Instance::ReportDeviceFault(const char* where) const {
+    // Several threads can see the loss at once (CP thread, presenter): report once, and make the others wait
+    // for it so none of them aborts the process mid-report
+    static std::mutex report_mutex;
+    static bool reported = false;
+    std::scoped_lock lock{report_mutex};
+    // The report goes to the log file; the console gets one Render event
+    Common::Log::Detail::FileOnlyCriticals file_only;
+    if (reported) {
+        LOG_CRITICAL(Render_Vulkan, "Device lost ({}); already reported", where);
+        return;
+    }
+    reported = true;
+    Common::Log::Event(
+        Common::Log::EventKind::Render,
+        fmt::format("GPU crashed or hung (VK_ERROR_DEVICE_LOST), detected in {}", where),
+        {"GPU checkpoints and the driver fault report are in the log file"});
+    ReportGpuCheckpoints(where);
+    if (!device_fault) {
+        LOG_CRITICAL(Render_Vulkan, "Device lost ({}); device fault report unavailable", where);
+        return;
+    }
+    vk::DeviceFaultCountsEXT counts{};
+    vk::Result result = device->getFaultInfoEXT(&counts, nullptr);
+    if (result != vk::Result::eSuccess && result != vk::Result::eIncomplete) {
+        LOG_CRITICAL(Render_Vulkan, "Device lost ({}); vkGetDeviceFaultInfoEXT failed: {}", where,
+                     vk::to_string(result));
+        return;
+    }
+    std::vector<vk::DeviceFaultAddressInfoEXT> addresses(counts.addressInfoCount);
+    std::vector<vk::DeviceFaultVendorInfoEXT> vendors(counts.vendorInfoCount);
+    vk::DeviceFaultInfoEXT info{};
+    info.pAddressInfos = addresses.data();
+    info.pVendorInfos = vendors.data();
+    counts.vendorBinarySize = 0;
+    result = device->getFaultInfoEXT(&counts, &info);
+    LOG_CRITICAL(Render_Vulkan, "=== Device fault report ({}): {} addresses, {} vendor infos ===",
+                 where, counts.addressInfoCount, counts.vendorInfoCount);
+    LOG_CRITICAL(Render_Vulkan, "description: {}", info.description.data());
+    if (counts.addressInfoCount == 0 && counts.vendorInfoCount == 0) {
+        LOG_CRITICAL(Render_Vulkan, "empty fault report: the driver gave no details, which does "
+                                    "not rule out a shader memory fault");
+    }
+    for (u32 i = 0; i < counts.addressInfoCount; ++i) {
+        const auto& address = addresses[i];
+        LOG_CRITICAL(Render_Vulkan, "fault address: {} reported {:#x} (precision {:#x})",
+                     vk::to_string(address.addressType), static_cast<u64>(address.reportedAddress),
+                     static_cast<u64>(address.addressPrecision));
+    }
+    for (u32 i = 0; i < counts.vendorInfoCount; ++i) {
+        const auto& vendor = vendors[i];
+        LOG_CRITICAL(Render_Vulkan, "vendor fault: {} code {:#x} data {:#x}",
+                     vendor.description.data(), static_cast<u64>(vendor.vendorFaultCode),
+                     static_cast<u64>(vendor.vendorFaultData));
+    }
 }
 
 } // namespace Vulkan

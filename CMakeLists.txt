@@ -213,13 +213,13 @@ execute_process(
 
 # Set Version
 set(EMULATOR_VERSION_MAJOR "0")
-set(EMULATOR_VERSION_MINOR "18")
-set(EMULATOR_VERSION_PATCH "1")
+set(EMULATOR_VERSION_MINOR "4")
+set(EMULATOR_VERSION_PATCH "0")
 
 set_source_files_properties(src/dist/shadps4.rc PROPERTIES COMPILE_DEFINITIONS "EMULATOR_VERSION_MAJOR=${EMULATOR_VERSION_MAJOR};EMULATOR_VERSION_MINOR=${EMULATOR_VERSION_MINOR};EMULATOR_VERSION_PATCH=${EMULATOR_VERSION_PATCH}")
 
 set(APP_VERSION_NUM "${EMULATOR_VERSION_MAJOR}.${EMULATOR_VERSION_MINOR}.${EMULATOR_VERSION_PATCH}")
-set(APP_VERSION "${APP_VERSION_NUM} WIP")
+set(APP_VERSION "${APP_VERSION_NUM}")
 set(APP_IS_RELEASE false)
 configure_file("${CMAKE_CURRENT_SOURCE_DIR}/src/common/scm_rev.cpp.in" "${CMAKE_CURRENT_BINARY_DIR}/src/common/scm_rev.cpp" @ONLY)
 
@@ -771,6 +771,8 @@ set(DEV_TOOLS src/core/devtools/layer.cpp
 
 set(COMMON src/common/logging/classes.cpp
            src/common/logging/classes.h
+           src/common/logging/events.cpp
+           src/common/logging/events.h
            src/common/logging/formatter.h
            src/common/logging/log.cpp
            src/common/logging/log.h
@@ -787,7 +789,14 @@ set(COMMON src/common/logging/classes.cpp
            src/common/debug.h
            src/common/decoder.cpp
            src/common/decoder.h
+           src/common/cp_profiler.cpp
+           src/common/cp_profiler.h
            src/common/elf_info.h
+           src/common/guest_write_journal.cpp
+           src/common/guest_write_journal.h
+           src/common/harness.h
+           src/common/perf_stats.cpp
+           src/common/perf_stats.h
            src/common/endian.h
            src/common/enum.h
            src/common/incremental_id.h
@@ -838,6 +847,7 @@ set(COMMON src/common/logging/classes.cpp
            src/common/number_utils.cpp
            src/common/memory_patcher.h
            src/common/memory_patcher.cpp
+           src/common/multi_level_page_table.h
            ${CMAKE_CURRENT_BINARY_DIR}/src/common/scm_rev.cpp
            src/common/scm_rev.h
            src/common/key_manager.cpp
@@ -947,6 +957,8 @@ set(CORE src/core/aerolib/stubs.cpp
          src/core/platform.h
          src/core/signals.cpp
          src/core/signals.h
+         src/core/stack_ranges.cpp
+         src/core/stack_ranges.h
          src/core/thread.cpp
          src/core/thread.h
          src/core/tls.cpp
@@ -972,6 +984,7 @@ set(SHADER_RECOMPILER src/shader_recompiler/profile.h
                       src/shader_recompiler/recompiler.cpp
                       src/shader_recompiler/recompiler.h
                       src/shader_recompiler/resource.h
+                      src/shader_recompiler/info.cpp
                       src/shader_recompiler/info.h
                       src/shader_recompiler/params.h
                       src/shader_recompiler/runtime_info.h
@@ -1104,6 +1117,8 @@ set(VIDEO_CORE src/video_core/amdgpu/cb_db_extent.h
                src/video_core/amdgpu/resource.h
                src/video_core/amdgpu/tiling.cpp
                src/video_core/amdgpu/tiling.h
+               src/video_core/buffer_cache/bpe_heap_guard.cpp
+               src/video_core/buffer_cache/bpe_heap_guard.h
                src/video_core/buffer_cache/buffer.cpp
                src/video_core/buffer_cache/buffer.h
                src/video_core/buffer_cache/buffer_cache.cpp
@@ -1116,14 +1131,17 @@ set(VIDEO_CORE src/video_core/amdgpu/cb_db_extent.h
                src/video_core/buffer_cache/region_manager.h
                src/video_core/renderer_vulkan/liverpool_to_vk.cpp
                src/video_core/renderer_vulkan/liverpool_to_vk.h
-               src/video_core/renderer_vulkan/vk_barrier_tracker.cpp
-               src/video_core/renderer_vulkan/vk_barrier_tracker.h
+               src/video_core/renderer_vulkan/vk_access_bitmap.cpp
+               src/video_core/renderer_vulkan/vk_access_bitmap.h
+               src/video_core/renderer_vulkan/vk_bind_cache.h
                src/video_core/renderer_vulkan/vk_common.cpp
                src/video_core/renderer_vulkan/vk_common.h
                src/video_core/renderer_vulkan/vk_compute_pipeline.cpp
                src/video_core/renderer_vulkan/vk_compute_pipeline.h
                src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp
                src/video_core/renderer_vulkan/vk_graphics_pipeline.h
+               src/video_core/renderer_vulkan/vk_draw_trace.h
+               src/video_core/renderer_vulkan/vk_gpu_checkpoints.h
                src/video_core/renderer_vulkan/vk_instance.cpp
                src/video_core/renderer_vulkan/vk_instance.h
                src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
@@ -1142,6 +1160,9 @@ set(VIDEO_CORE src/video_core/amdgpu/cb_db_extent.h
                src/video_core/renderer_vulkan/vk_resource_pool.h
                src/video_core/renderer_vulkan/vk_runtime.cpp
                src/video_core/renderer_vulkan/vk_runtime.h
+               src/video_core/renderer_vulkan/vk_recorder.cpp
+               src/video_core/renderer_vulkan/vk_recorder.h
+               src/video_core/renderer_vulkan/vk_recorder_cmds.inc
                src/video_core/renderer_vulkan/vk_scheduler.cpp
                src/video_core/renderer_vulkan/vk_scheduler.h
                src/video_core/renderer_vulkan/vk_semaphore.cpp
@@ -1154,6 +1175,8 @@ set(VIDEO_CORE src/video_core/amdgpu/cb_db_extent.h
                src/video_core/renderer_vulkan/vk_staging_buffer_pool.h
                src/video_core/renderer_vulkan/vk_swapchain.cpp
                src/video_core/renderer_vulkan/vk_swapchain.h
+               src/video_core/renderer_vulkan/host_passes/dlssnr_pass.cpp
+               src/video_core/renderer_vulkan/host_passes/dlssnr_pass.h
                src/video_core/renderer_vulkan/host_passes/fsr_pass.cpp
                src/video_core/renderer_vulkan/host_passes/fsr_pass.h
                src/video_core/renderer_vulkan/host_passes/pp_pass.cpp
@@ -1164,6 +1187,8 @@ set(VIDEO_CORE src/video_core/amdgpu/cb_db_extent.h
                src/video_core/texture_cache/host_compatibility.h
                src/video_core/texture_cache/image.cpp
                src/video_core/texture_cache/image.h
+               src/video_core/texture_cache/image_barriers.cpp
+               src/video_core/texture_cache/image_barriers.h
                src/video_core/texture_cache/image_info.cpp
                src/video_core/texture_cache/image_info.h
                src/video_core/texture_cache/image_view.cpp
@@ -1177,9 +1202,10 @@ set(VIDEO_CORE src/video_core/amdgpu/cb_db_extent.h
                src/video_core/texture_cache/types.h
                src/video_core/cache_storage.cpp
                src/video_core/cache_storage.h
+               src/video_core/mapped_page_table.cpp
+               src/video_core/mapped_page_table.h
                src/video_core/page_manager.cpp
                src/video_core/page_manager.h
-               src/video_core/multi_level_page_table.h
                src/video_core/renderdoc.cpp
                src/video_core/renderdoc.h
 )
@@ -1400,6 +1426,20 @@ endif()
 
 if (WIN32)
     target_sources(shadps4 PRIVATE src/dist/shadps4.rc)
+
+    # Load the DLSS Neural Rendering bridge from the folder of shadps4.exe
+    # Include "nvngx.dll" in its name because the model checks the caller's module path
+    add_library(dlssnr_bridge SHARED
+        src/video_core/renderer_vulkan/host_passes/dlssnr_bridge/dlssnr_bridge.cpp
+        src/video_core/renderer_vulkan/host_passes/dlssnr_bridge/dlssnr_bridge.h
+    )
+    set_target_properties(dlssnr_bridge PROPERTIES
+        OUTPUT_NAME "nvngx.dll_dlssnr"
+        PREFIX ""
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}"
+    )
+    target_link_libraries(dlssnr_bridge PRIVATE advapi32)
+    add_dependencies(shadps4 dlssnr_bridge)
 endif()
 
 if (NOT MSVC)

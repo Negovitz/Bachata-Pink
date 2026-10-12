@@ -64,7 +64,7 @@ struct Buffer {
             .b = CompSwizzle(dst_sel_z),
             .a = CompSwizzle(dst_sel_w),
         };
-        return RemapSwizzle(DataFormat(data_format), dst_sel);
+        return RemapSwizzle(DataFormat(data_format), dst_sel.Normalized());
     }
 
     NumberFormat GetNumberFmt() const noexcept {
@@ -215,7 +215,7 @@ struct Image {
             .b = CompSwizzle(dst_sel_z),
             .a = CompSwizzle(dst_sel_w),
         };
-        return RemapSwizzle(DataFormat(data_format), dst_sel);
+        return RemapSwizzle(DataFormat(data_format), dst_sel.Normalized());
     }
 
     u32 Pitch() const {
@@ -457,8 +457,10 @@ struct Sampler {
         return raw0 != 0 || raw1 != 0;
     }
 
+    /// Fields with no defined value on GCN. Anisotropy ratios 5-7 are not checked: the hardware
+    /// takes them as the maximum and SotC emits them in samplers it uses (see MaxAniso)
     bool Valid() const {
-        return true;
+        return filter_mode.Value() <= FilterMode::Max && mip_filter.Value() <= MipFilter::Linear;
     }
 
     bool operator==(const Sampler& other) const noexcept {
@@ -491,7 +493,9 @@ struct Sampler {
         case AnisoRatio::Sixteen:
             return 16.0f;
         default:
-            UNREACHABLE();
+            // Bits 9-11 hold 3 bits but only 0-4 have a defined ratio. Hardware treats 5-7 as the maximum and
+            // SotC emits them; falling back to 16x keeps the sampler valid
+            return 16.0f;
         }
     }
 };

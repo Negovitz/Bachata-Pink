@@ -75,6 +75,16 @@ public:
         return present_queue;
     }
 
+    /// readback_ahead_transfer_queue: a queue of a transfer-only family (the copy engine), null when off or
+    /// unavailable. Buffers are then shared concurrently between the two families
+    vk::Queue GetTransferQueue() const {
+        return transfer_queue;
+    }
+
+    u32 GetTransferQueueFamilyIndex() const {
+        return transfer_queue_family_index;
+    }
+
     TracyVkCtx GetProfilerContext() const {
         return profiler_context;
     }
@@ -266,6 +276,12 @@ public:
         return shader_clock && shader_clock_features.shaderSubgroupClock;
     }
 
+    /// Returns true when VK_KHR_external_memory_win32 and VK_KHR_external_semaphore_win32 are
+    /// enabled, so images and fences can be shared with D3D12
+    bool IsD3D12InteropSupported() const {
+        return d3d12_interop;
+    }
+
     /// Returns the vendor ID of the physical device
     u32 GetVendorID() const {
         return properties.vendorID;
@@ -314,6 +330,11 @@ public:
     /// Returns the pipeline cache unique identifier
     const auto GetPipelineCacheUUID() const {
         return properties.pipelineCacheUUID;
+    }
+
+    /// Returns the physical device limits
+    const vk::PhysicalDeviceLimits& GetLimits() const {
+        return properties.limits;
     }
 
     /// Returns the minimum required alignment for uniforms
@@ -461,9 +482,21 @@ public:
     /// Determines if a format is supported for a set of feature flags.
     [[nodiscard]] bool IsFormatSupported(vk::Format format, vk::FormatFeatureFlags2 flags) const;
 
+    /// Returns true when VK_NV_device_diagnostic_checkpoints is enabled (gpu_checkpoints)
+    bool IsNvDiagnosticCheckpointsSupported() const {
+        return nv_diagnostic_checkpoints;
+    }
+
+    /// Logs the gpu_checkpoints report (recent commands, submit ledger, NV queue checkpoints) and the
+    /// VK_EXT_device_fault report after a device loss. Call it before aborting
+    void ReportDeviceFault(const char* where) const;
+
 private:
     /// Creates the logical device opportunistically enabling extensions
     bool CreateDevice();
+
+    /// Part of ReportDeviceFault: only with the gpu_checkpoints setting on
+    void ReportGpuCheckpoints(const char* where) const;
 
     /// Creates the VMA allocator handle
     void CreateAllocator();
@@ -503,6 +536,8 @@ private:
     VmaAllocator allocator{};
     vk::Queue present_queue;
     vk::Queue graphics_queue;
+    vk::Queue transfer_queue;
+    u32 transfer_queue_family_index{};
     std::vector<vk::PhysicalDevice> physical_devices;
     std::vector<std::string> available_extensions;
     std::unordered_map<vk::Format, vk::FormatProperties3> format_properties;
@@ -535,6 +570,10 @@ private:
     bool shader_clock{};
     bool supports_memory_budget{};
     bool supports_block_texel_view{};
+    bool device_fault{};
+    bool d3d12_interop{};
+    bool nv_diagnostic_checkpoints{};
+    bool nv_diagnostics_config{};
     u64 total_memory_budget{};
     std::vector<size_t> valid_heaps;
 };

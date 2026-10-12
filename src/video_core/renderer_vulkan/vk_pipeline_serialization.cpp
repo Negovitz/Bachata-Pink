@@ -5,6 +5,7 @@
 #include "core/emulator_settings.h"
 #include "shader_recompiler/frontend/fetch_shader.h"
 #include "shader_recompiler/info.h"
+#include "shader_recompiler/ir/passes/srt.h"
 #include "video_core/cache_storage.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
@@ -12,12 +13,76 @@
 
 namespace Serialization {
 /* You should increment versions below once corresponding serialization scheme is changed. */
-static constexpr u32 ShaderBinaryVersion = 5u;
-static constexpr u32 ShaderMetaVersion = 5u;
+// ShaderBinaryVersion 6: SRT walkers recover per invocation, 10_11_11 and add_tid tolerate garbage
+// descriptors, DMA fault bitmap uses bounds checks and atomics. ShaderMetaVersion 6: meta records the codegen
+// settings key; Info gains uses_loop_cap. ShaderMetaVersion 7: HwFragmentRuntimeInfo gains
+// early_fragment_tests, InfoPersistent gains sharp_tables and ImageResource the descriptor array fields (all
+// stored raw). ShaderMetaVersion 8: SharpFetch gains summary and FetchShaderData changes layout (#5112,
+// plus one_vgprs). ShaderMetaVersion 9: with srt_walker_clean_reads the SRT walker guest loads test the
+// clean-page bitmap first (the key is in the codegen settings key). ShaderBinaryVersion 7: subgroup built-in
+// inputs are Flat only in fragment shaders (vertex shaders had an invalid Flat)
+// ShaderBinaryVersion 8: upstream ISA fixes (#5030, #5031, #5141, #5185, #5186,
+// #5194, #5199, #5200, #5202)
+static constexpr u32 ShaderBinaryVersion = 8u;
+static constexpr u32 ShaderMetaVersion = 9u;
 static constexpr u32 PipelineKeyVersion = 3u;
 } // namespace Serialization
 
 namespace Vulkan {
+
+namespace {
+/// Emulator settings that change the generated SPIR-V. The disk cache is keyed only by the guest shader hash,
+/// so a shader compiled with other values must be recompiled, not loaded
+constexpr u32 LdsBarriersLargeGroupsBit = 46;
+constexpr u32 RelativeInstanceIdBit = 47;
+constexpr u32 GcnNanSemanticsBit = 48;
+constexpr u32 LegacyMadSemanticsBit = 49;
+
+u64 CodegenSettingsKey() {
+    return u64{EmulatorSettings.GetComputeLoopCap()} |
+           (u64{EmulatorSettings.IsDirectMemoryAccessEnabled()} << 32) |
+           (u64{EmulatorSettings.IsLdsBarrierUniformReadlane()} << 33) |
+           (u64{EmulatorSettings.IsEarlyFragmentTestsFromZOrder()} << 34) |
+           (u64{Shader::DynamicTsharpArraySize()} << 35) | // 7 bits, at most 64
+           (u64{EmulatorSettings.IsWave64UniformBranches()} << 42) |
+           (u64{EmulatorSettings.IsInlineFetchShader()} << 43) |
+           (u64{EmulatorSettings.IsSrtWalkerCleanReads()} << 44) | // SRT walker code
+           (u64{EmulatorSettings.IsWave64MissingLaneIdentity()} << 45) |
+           (u64{EmulatorSettings.IsLdsBarriersLargeGroups()} << LdsBarriersLargeGroupsBit) |
+           (u64{EmulatorSettings.IsRelativeInstanceId()} << RelativeInstanceIdBit) |
+           (u64{EmulatorSettings.IsGcnNanSemantics()} << GcnNanSemanticsBit) |
+           (u64{EmulatorSettings.IsLegacyMadSemantics()} << LegacyMadSemanticsBit);
+}
+
+/// lds_barriers_large_groups only affects compute shaders that use LDS in workgroups larger than
+/// one GCN wave
+/// Keep other cached shaders valid across setting changes so toggling it recompiles only the
+/// shaders that need different barriers
+/// SharedMemoryBarrierPass uses this same condition when deciding whether the workaround applies
+bool LdsBarriersLargeGroupsAffects(const Shader::RuntimeInfo& runtime_info) {
+    if (runtime_info.hw_stage != Shader::HwStage::Compute) {
+        return false;
+    }
+    const auto& cs = runtime_info.hw.cs;
+    return cs.shared_memory_size != 0 &&
+           cs.workgroup_size[0] * cs.workgroup_size[1] * cs.workgroup_size[2] > 64;
+}
+
+/// relative_instance_id only affects vertex shaders that receive instance ID VGPRs
+/// (Translator::EmitPrologue), so toggling it keeps the other cached shaders
+bool RelativeInstanceIdAffects(const Shader::RuntimeInfo& runtime_info) {
+    return runtime_info.sw_stage == Shader::SwStage::Vertex &&
+           runtime_info.props.num_input_vgprs > 0;
+}
+
+/// Permutations preloaded into a program already in the cache, and how many of them
+/// carried flattened user data other than the program's
+struct PreloadUdStats {
+    u32 added_permutations;
+    u32 differing;
+    u32 size_mismatch;
+} preload_ud_stats{};
+} // namespace
 
 void RegisterPipelineData(const ComputePipelineKey& key,
                           ComputePipeline::SerializationSupport& sdata) {
@@ -64,12 +129,20 @@ void RegisterShaderMeta(const Shader::Info& info,
     if (!Storage::DataBase::Instance().IsOpened()) {
         return;
     }
+    // A program whose walker did not fit the code buffer reads zeros from its SRT; caching it would keep it
+    // broken in the next runs
+    if (!info.srt_info.walker_func &&
+        info.srt_info.flattened_bufsize_dw - info.SharpTableDwords() >
+            Shader::NUM_USER_DATA_REGS) {
+        return;
+    }
 
     Serialization::Archive ar;
     Serialization::Writer meta{ar};
 
     meta.Write(Serialization::ShaderMetaVersion);
     meta.Write(Serialization::ShaderBinaryVersion);
+    meta.Write(CodegenSettingsKey());
 
     meta.Write(perm_hash);
     meta.Write(perm_idx);
@@ -92,7 +165,6 @@ void RegisterShaderBinary(std::vector<u32>&& spv, u64 pgm_hash, size_t perm_idx)
 }
 
 bool LoadShaderMeta(Serialization::Archive& ar, Shader::Info& info,
-                    std::optional<Shader::Gcn::FetchShaderData>& fetch_shader_data,
                     Shader::StageSpecialization& spec, size_t& perm_idx) {
     Serialization::Reader meta{ar};
 
@@ -108,14 +180,31 @@ bool LoadShaderMeta(Serialization::Archive& ar, Shader::Info& info,
         return false;
     }
 
+    u64 codegen_key{};
+    meta.Read(codegen_key);
+    const u64 key_diff = codegen_key ^ CodegenSettingsKey();
+    constexpr u64 lds_barriers_mask = u64{1} << LdsBarriersLargeGroupsBit;
+    constexpr u64 relative_instance_mask = u64{1} << RelativeInstanceIdBit;
+    if ((key_diff & ~(lds_barriers_mask | relative_instance_mask)) != 0) {
+        return false;
+    }
+
     u64 perm_hash_ar{};
     meta.Read(perm_hash_ar);
     meta.Read(perm_idx);
 
     spec.Deserialize(ar);
-    info.Deserialize(ar);
-
-    fetch_shader_data = spec.fetch_shader_data;
+    if ((key_diff & lds_barriers_mask) != 0 &&
+        LdsBarriersLargeGroupsAffects(spec.runtime_info)) {
+        return false;
+    }
+    if ((key_diff & relative_instance_mask) != 0 &&
+        RelativeInstanceIdAffects(spec.runtime_info)) {
+        return false;
+    }
+    if (!info.Deserialize(ar)) {
+        return false;
+    }
     return true;
 }
 
@@ -209,6 +298,11 @@ bool GraphicsPipeline::SerializationSupport::Deserialize(Serialization::Archive&
 }
 
 bool PipelineCache::LoadGraphicsPipeline(Serialization::Archive& ar) {
+    // A preload that failed halfway leaves its stages here; they must not reach this pipeline
+    infos.fill(nullptr);
+    modules.fill(nullptr);
+    fetch_shader = nullptr;
+
     graphics_key.Deserialize(ar);
 
     GraphicsPipeline::SerializationSupport sdata{};
@@ -243,7 +337,7 @@ bool PipelineCache::LoadGraphicsPipeline(Serialization::Archive& ar) {
 
     infos.fill(nullptr);
     modules.fill(nullptr);
-    fetch_shader.reset();
+    fetch_shader = nullptr;
 
     return true;
 }
@@ -253,7 +347,7 @@ bool PipelineCache::LoadPipelineStage(Serialization::Archive& ar, size_t stage) 
     Shader::StageSpecialization spec{};
     spec.info = &program->info;
     size_t perm_idx{};
-    if (!LoadShaderMeta(ar, program->info, fetch_shader, spec, perm_idx)) {
+    if (!LoadShaderMeta(ar, program->info, spec, perm_idx)) {
         return false;
     }
 
@@ -275,12 +369,11 @@ bool PipelineCache::LoadPipelineStage(Serialization::Archive& ar, size_t stage) 
         module = CompileSPV(spv, instance.GetDevice());
         it_pgm.value() = std::move(program);
     } else {
-        const auto& it = std::ranges::find(it_pgm.value()->modules, spec, &Program::Module::spec);
-        if (it != it_pgm.value()->modules.end()) {
+        if (const auto found = it_pgm.value()->FindPermut(spec)) {
             // A matching permutation is valid only at its original index. A different index means
             // the store holds entries from more than one cache generation, so this pipeline is
             // left to compile at runtime.
-            const auto idx = std::distance(it_pgm.value()->modules.begin(), it);
+            const auto idx = *found;
             if (perm_idx != idx) {
                 LOG_WARNING(Render_Vulkan,
                             "Cached permutation {} of {}_{:x} conflicts with index {}, skipping "
@@ -288,15 +381,30 @@ bool PipelineCache::LoadPipelineStage(Serialization::Archive& ar, size_t stage) 
                             perm_idx, program->info.hw_stage, program->info.pgm_hash, idx);
                 return false;
             }
-            module = it->module;
+            module = it_pgm.value()->modules[idx].module;
         } else {
             module = CompileSPV(spv, instance.GetDevice());
+            // Build the pipeline with this record's flattened user data
+            // The first record may have different descriptor counts
+            // Keep a different buffer size unchanged because it uses another SRT layout
+            auto& program_ud = it_pgm.value()->info.flattened_ud_buf;
+            auto& record_ud = program->info.flattened_ud_buf;
+            ++preload_ud_stats.added_permutations;
+            if (record_ud.size() != program_ud.size()) {
+                ++preload_ud_stats.size_mismatch;
+            } else if (record_ud != program_ud) {
+                ++preload_ud_stats.differing;
+                program_ud = std::move(record_ud);
+            }
         }
     }
     it_pgm.value()->InsertPermut(module, std::move(spec), perm_idx);
 
     infos[stage] = &it_pgm.value()->info;
     modules[stage] = module;
+    if (auto& fetch = it_pgm.value()->modules[perm_idx].spec.fetch_shader_data; !fetch.Empty()) {
+        fetch_shader = &fetch;
+    }
 
     return true;
 }
@@ -369,6 +477,13 @@ void PipelineCache::WarmUp() {
         });
 
     LOG_INFO(Render, "Preloaded {} pipelines", num_pipelines);
+    LOG_INFO(Render,
+             "Preloaded permutations of known programs: {}, {} with their own flattened user data, "
+             "{} with another size (kept the program's)",
+             preload_ud_stats.added_permutations, preload_ud_stats.differing,
+             preload_ud_stats.size_mismatch);
+    LOG_INFO(Render, "SRT walker code after preload: {} KiB, {} KiB shared with identical walkers",
+             Shader::GetSrtCodeUsage() >> 10, Shader::GetSrtCodeShared() >> 10);
     if (num_total_pipelines > num_pipelines) {
         LOG_WARNING(Render, "{} stale pipelines were found. Consider re-generating the cache",
                     num_total_pipelines - num_pipelines);
@@ -410,6 +525,7 @@ void Gcn::FetchShaderData::Serialize(Serialization::Archive& ar) const {
     fetch.Write(vertex_offset_sgpr);
     fetch.Write(instance_offset_sgpr);
     fetch.Write(attributes);
+    fetch.Write(one_vgprs);
 }
 
 bool Gcn::FetchShaderData::Deserialize(Serialization::Archive& ar) {
@@ -419,6 +535,7 @@ bool Gcn::FetchShaderData::Deserialize(Serialization::Archive& ar) {
     fetch.Read(vertex_offset_sgpr);
     fetch.Read(instance_offset_sgpr);
     fetch.Read(attributes);
+    fetch.Read(one_vgprs);
 
     return true;
 }
@@ -440,6 +557,11 @@ bool PersistentSrtInfo::Deserialize(Serialization::Archive& ar) {
     if (walker_func_size) {
         walker_func = RegisterWalkerCode(ar.CurrPtr(), walker_func_size);
         ar.Advance(walker_func_size);
+        if (!walker_func) {
+            // No space left in the walker buffer: fail the load, the pipeline is compiled at runtime instead
+            walker_func_size = 0;
+            return false;
+        }
     }
 
     return true;
@@ -453,9 +575,9 @@ void StageSpecialization::Serialize(Serialization::Archive& ar) const {
 
     spec.Write(bitset.to_string());
 
-    if (fetch_shader_data) {
-        spec.Write(sizeof(*fetch_shader_data));
-        fetch_shader_data->Serialize(ar);
+    if (!fetch_shader_data.Empty()) {
+        spec.Write(sizeof(fetch_shader_data));
+        fetch_shader_data.Serialize(ar);
     } else {
         spec.Write(size_t{0});
     }

@@ -1,6 +1,12 @@
 // SPDX-FileCopyrightText: Copyright 2025 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cstdlib>
+
+#include "common/div_ceil.h"
+#include "common/logging/events.h"
+#include "common/perf_stats.h"
+#include "core/emulator_settings.h"
 #include "video_core/buffer_cache/buffer.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
@@ -38,7 +44,7 @@ static std::pair<u32, u32> SanitizeCopyLayers(const VideoCore::ImageInfo& src_in
     u32 src_layers = src_info.resources.layers;
     u32 dst_layers = dst_info.resources.layers;
 
-    // 3D images can only use 1 layer.
+    // 3D images use exactly one layer
     if (vk_src_type == vk::ImageType::e3D && src_layers != 1) {
         LOG_WARNING(Render_Vulkan, "Coercing copy 3D source layers {} to 1.", src_layers);
         src_layers = 1;
@@ -48,7 +54,7 @@ static std::pair<u32, u32> SanitizeCopyLayers(const VideoCore::ImageInfo& src_in
         dst_layers = 1;
     }
 
-    // If the image type is equal, layer count must match. Take the minimum of both.
+    // Images of the same type need matching layer counts, so use the smaller count
     if (vk_src_type == vk_dst_type) {
         if (src_layers != dst_layers) {
             LOG_WARNING(Render_Vulkan,
@@ -57,7 +63,7 @@ static std::pair<u32, u32> SanitizeCopyLayers(const VideoCore::ImageInfo& src_in
             src_layers = dst_layers = std::min(src_layers, dst_layers);
         }
     } else {
-        // For 2D <-> 3D copies, 2D layer count must equal 3D depth.
+        // For 2D and 3D copies, the 2D layer count must match the 3D depth
         if (vk_src_type == vk::ImageType::e2D && vk_dst_type == vk::ImageType::e3D &&
             src_layers != depth) {
             LOG_WARNING(Render_Vulkan,
@@ -75,6 +81,14 @@ static std::pair<u32, u32> SanitizeCopyLayers(const VideoCore::ImageInfo& src_in
     }
 
     return std::make_pair(src_layers, dst_layers);
+}
+
+/// Keep the copy inside both images, even when overlapping images at the same address have different sizes
+/// Compare block counts for compressed formats, then return the extent in source texels
+static u32 ClampCopyExtent(u32 src_extent, u32 src_block, u32 dst_extent, u32 dst_block) {
+    const u32 src_blocks = Common::DivCeil(src_extent, src_block);
+    const u32 dst_blocks = Common::DivCeil(dst_extent, dst_block);
+    return std::min(std::min(src_blocks, dst_blocks) * src_block, src_extent);
 }
 
 static u32 BufferImageCopySize(const vk::BufferImageCopy& copy, const vk::Format pixel_format) {
@@ -95,8 +109,18 @@ static u32 BufferImageCopySize(const vk::BufferImageCopy& copy, const vk::Format
 }
 
 Runtime::Runtime(const Instance& instance_, Scheduler& scheduler_)
-    : instance{instance_}, scheduler{scheduler_}, staging_pool{instance_, scheduler_} {
+    : instance{instance_}, scheduler{scheduler_}, staging_pool{instance_, scheduler_},
+      access_bitmap_tracking{EmulatorSettings.IsAccessBitmapTracking()},
+      access_bitmap_toggle{Common::PerfStats::AbToggleFollows("access_bitmap_tracking")},
+      access_bitmap_verify{access_bitmap_tracking &&
+                           std::getenv("SHADPS4_ACCESS_BITMAP_VERIFY") != nullptr} {
     blit_helper = std::make_unique<VideoCore::BlitHelper>(instance, scheduler);
+    access_bitmap_on =
+        access_bitmap_tracking && Common::PerfStats::AbToggleOn(access_bitmap_toggle);
+    if (access_bitmap_tracking) {
+        LOG_WARNING(Render_Vulkan, "Workaround access_bitmap_tracking enabled{}",
+                    access_bitmap_verify ? " (verify)" : "");
+    }
 
     memory_barrier.dstStageMask = vk::PipelineStageFlagBits2::eAllCommands;
     memory_barrier.dstAccessMask =
@@ -226,7 +250,7 @@ void Runtime::DownloadImage(VideoCore::Image* src, const VideoCore::Buffer* dst,
 void Runtime::CopyImage(VideoCore::Image* src, VideoCore::Image* dst) {
     const u32 num_mips = std::min(src->info.resources.levels, dst->info.resources.levels);
 
-    // Format mismatch warning (safe but useful)
+    // Flag format mismatches to help diagnose copies with undefined results
     if (src->info.pixel_format != dst->info.pixel_format) {
         LOG_DEBUG(Render_Vulkan,
                   "Copy between different formats: src={}, dst={}. "
@@ -234,10 +258,10 @@ void Runtime::CopyImage(VideoCore::Image* src, VideoCore::Image* dst) {
                   vk::to_string(src->info.pixel_format), vk::to_string(dst->info.pixel_format));
     }
 
-    const u32 base_width = src->info.size.width;
-    const u32 base_height = src->info.size.height;
     const u32 base_depth =
         dst->info.type == AmdGpu::ImageType::Color3D ? dst->info.size.depth : src->info.size.depth;
+    const auto src_block = vk::blockExtent(src->info.pixel_format);
+    const auto dst_block = vk::blockExtent(dst->info.pixel_format);
 
     // Match sample count before copying
     SetBackingSamples(dst, dst->info.num_samples, false);
@@ -259,11 +283,22 @@ void Runtime::CopyImage(VideoCore::Image* src, VideoCore::Image* dst) {
     const bool is_same_type = !is_2d_to_3d && !is_3d_to_2d;
 
     for (u32 mip = 0; mip < num_mips; ++mip) {
-        const u32 mip_w = std::max(base_width >> mip, 1u);
-        const u32 mip_h = std::max(base_height >> mip, 1u);
+        const u32 mip_w = ClampCopyExtent(std::max(src->info.size.width >> mip, 1u), src_block[0],
+                                          std::max(dst->info.size.width >> mip, 1u), dst_block[0]);
+        const u32 mip_h =
+            ClampCopyExtent(std::max(src->info.size.height >> mip, 1u), src_block[1],
+                            std::max(dst->info.size.height >> mip, 1u), dst_block[1]);
         const u32 mip_d = std::max(base_depth >> mip, 1u);
+        const u32 src_mip_d = std::max(src->info.size.depth >> mip, 1u);
+        const u32 dst_mip_d = std::max(dst->info.size.depth >> mip, 1u);
 
-        const auto [src_layers, dst_layers] = SanitizeCopyLayers(src->info, dst->info, mip_d);
+        auto [src_layers, dst_layers] = SanitizeCopyLayers(src->info, dst->info, mip_d);
+        // SanitizeCopyLayers matches 2D layers to 3D depth, so clamp the result to the 2D image
+        if (is_2d_to_3d) {
+            src_layers = std::min(src_layers, src->info.resources.layers);
+        } else if (is_3d_to_2d) {
+            dst_layers = std::min(dst_layers, dst->info.resources.layers);
+        }
 
         vk::ImageCopy region{};
         region.srcSubresource.aspectMask = src_aspect;
@@ -274,14 +309,14 @@ void Runtime::CopyImage(VideoCore::Image* src, VideoCore::Image* dst) {
         region.dstSubresource.baseArrayLayer = 0;
 
         if (is_same_type) {
-            // 2D->2D OR 3D->3D
+            // Both images have the same dimensionality
             if (src_is_3d) {
-                // 3D images must use layerCount=1
+                // Vulkan requires one layer for 3D images
                 region.srcSubresource.layerCount = 1;
                 region.dstSubresource.layerCount = 1;
-                region.extent = vk::Extent3D(mip_w, mip_h, mip_d);
+                region.extent = vk::Extent3D(mip_w, mip_h, std::min(src_mip_d, dst_mip_d));
             } else {
-                // Array images
+                // Copy only the layers shared by both arrays
                 const u32 copy_layers = std::min(src_layers, dst_layers);
                 region.srcSubresource.layerCount = copy_layers;
                 region.dstSubresource.layerCount = copy_layers;
@@ -321,17 +356,20 @@ void Runtime::CopyImage(VideoCore::Image* src, VideoCore::Image* dst) {
     dst->flags &= ~VideoCore::ImageFlagBits::Dirty;
 }
 
-void Runtime::CopyImageWithBuffer(VideoCore::Image* src, VideoCore::Image* dst,
-                                  const VideoCore::Buffer* buffer, u64 offset) {
+void Runtime::CopyImageWithBuffer(VideoCore::Image* src, VideoCore::Image* dst) {
     const u32 num_mips = std::min(src->info.resources.levels, dst->info.resources.levels);
+    // ResolveDepthOverlap may grow the new image, so copy only the layers shared by both images
     const u32 num_layers = std::min(src->info.resources.layers, dst->info.resources.layers);
-    ASSERT(src->info.resources.layers == dst->info.resources.layers && num_mips == 1);
+    ASSERT(num_mips == 1);
 
     SetBackingSamples(dst, dst->info.num_samples, false);
     SetBackingSamples(src, src->info.num_samples);
 
+    // The buffer copy reads and writes the same region, which must fit both images
+    const auto src_block = vk::blockExtent(src->info.pixel_format);
+    const auto dst_block = vk::blockExtent(dst->info.pixel_format);
     vk::BufferImageCopy buffer_copy = {
-        .bufferOffset = offset,
+        .bufferOffset = 0,
         .bufferRowLength = 0,
         .bufferImageHeight = 0,
         .imageSubresource{
@@ -341,9 +379,21 @@ void Runtime::CopyImageWithBuffer(VideoCore::Image* src, VideoCore::Image* dst,
             .layerCount = num_layers,
         },
         .imageOffset = {0, 0, 0},
-        .imageExtent = {src->info.size.width, src->info.size.height, src->info.size.depth},
+        .imageExtent = {ClampCopyExtent(src->info.size.width, src_block[0], dst->info.size.width,
+                                        dst_block[0]),
+                        ClampCopyExtent(src->info.size.height, src_block[1],
+                                        dst->info.size.height, dst_block[1]),
+                        std::min(src->info.size.depth, dst->info.size.depth)},
     };
-    const auto copy_size = BufferImageCopySize(buffer_copy, src->info.pixel_format);
+    // Size the staging buffer for either format, keeping the usual 128 MiB minimum for smaller copies
+    static constexpr u64 MIN_COPY_BUFFER_SIZE = 128_MB;
+    const u64 copy_size = std::max(BufferImageCopySize(buffer_copy, src->info.pixel_format),
+                                   BufferImageCopySize(buffer_copy, dst->info.pixel_format));
+    const auto copy_ref = staging_pool.Request(std::max(copy_size, MIN_COPY_BUFFER_SIZE),
+                                               VideoCore::MemoryType::DeviceLocal);
+    const VideoCore::Buffer* buffer = copy_ref.buffer;
+    const u64 offset = copy_ref.offset;
+    buffer_copy.bufferOffset = offset;
 
     scheduler.EndRendering();
 
@@ -433,21 +483,49 @@ void Runtime::CopyMip(VideoCore::Image* src, VideoCore::Image* dst, u32 mip, u32
     dst->flags &= ~VideoCore::ImageFlagBits::Dirty;
 }
 
+/// Depth formats whose depth aspect has the same texel layout in a buffer copy
+static u32 DepthCopyClass(vk::Format format) {
+    switch (format) {
+    case vk::Format::eD16Unorm:
+    case vk::Format::eD16UnormS8Uint:
+        return 1;
+    case vk::Format::eD32Sfloat:
+    case vk::Format::eD32SfloatS8Uint:
+        return 2;
+    case vk::Format::eX8D24UnormPack32:
+    case vk::Format::eD24UnormS8Uint:
+        return 3;
+    default:
+        return 0;
+    }
+}
+
 void Runtime::CopyColorAndDepth(VideoCore::Image* src, VideoCore::Image* dst) {
     if (src->info.num_samples == 1 && dst->info.num_samples == 1) {
-        if (instance.IsMaintenance8Supported() ||
-            src->info.props.is_depth == dst->info.props.is_depth) {
+        const bool depth_format_change = src->info.props.is_depth && dst->info.props.is_depth &&
+                                         src->info.pixel_format != dst->info.pixel_format;
+        const u32 src_depth_class = DepthCopyClass(src->info.pixel_format);
+        const bool buffer_depth_copy =
+            depth_format_change && src_depth_class != 0 &&
+            src_depth_class == DepthCopyClass(dst->info.pixel_format) &&
+            src->info.size == dst->info.size &&
+            std::min(src->info.resources.levels, dst->info.resources.levels) == 1;
+        if (buffer_depth_copy) {
+            // maintenance8 allows compatible color and depth copies, but it does not allow every
+            // pair of depth and stencil formats
+            // Use a buffer for the depth copy when the guest adds stencil, as required by VUID-
+            // vkCmdCopyImage-srcImage-01548
+            CopyImageWithBuffer(src, dst);
+        } else if (instance.IsMaintenance8Supported() ||
+                   src->info.props.is_depth == dst->info.props.is_depth) {
             CopyImage(src, dst);
         } else {
-            // Perform depth from/to color copy using the intermediate copy buffer.
-            static constexpr size_t COPY_BUFFER_SIZE = 128_MB;
-            const auto copy_ref =
-                staging_pool.Request(COPY_BUFFER_SIZE, VideoCore::MemoryType::DeviceLocal);
-            CopyImageWithBuffer(src, dst, copy_ref.buffer, copy_ref.offset);
+            // Copy between depth and color through an intermediate buffer
+            CopyImageWithBuffer(src, dst);
         }
     } else if (src->info.num_samples == 1 && dst->info.num_samples > 1 &&
                dst->info.props.is_depth) {
-        // Perform a rendering pass to transfer the channels of source as samples in dest.
+        // Use a rendering pass to transfer the source channels as destination samples
         bool needs_flush =
             Transit(src, vk::ImageLayout::eShaderReadOnlyOptimal,
                     vk::PipelineStageFlagBits2::eFragmentShader, vk::AccessFlagBits2::eShaderRead);
@@ -463,7 +541,7 @@ void Runtime::CopyColorAndDepth(VideoCore::Image* src, VideoCore::Image* dst) {
             dst->info.size.width, dst->info.size.height, dst->info.num_samples,
             src->info.pixel_format, dst->info.pixel_format, src->GetImage(), dst->GetImage());
     } else {
-        LOG_WARNING(Render_Vulkan, "Unimplemented depth overlap copy");
+        LOG_RENDER_PROBLEM(Render_Vulkan, Warning, "Unimplemented depth overlap copy");
     }
 }
 
@@ -638,7 +716,7 @@ void Runtime::SetBackingSamples(VideoCore::Image* image, u32 num_samples, bool c
         Transit(image, vk::ImageLayout::eShaderReadOnlyOptimal,
                 vk::PipelineStageFlagBits2::eFragmentShader, vk::AccessFlagBits2::eShaderRead);
 
-        // Transition dest backing to color attachment layout, not caring of previous contents
+        // Transition the destination backing to the color attachment layout without preserving its contents
         constexpr auto dst_stage = vk::PipelineStageFlagBits2::eColorAttachmentOutput;
         constexpr auto dst_access =
             vk::AccessFlagBits2::eColorAttachmentRead | vk::AccessFlagBits2::eColorAttachmentWrite;
@@ -663,12 +741,12 @@ void Runtime::SetBackingSamples(VideoCore::Image* image, u32 num_samples, bool c
         });
         FlushBarriers();
 
-        // Copy between ms and non ms backing images
+        // Copy between multisampled and single sample backing images
         blit_helper->CopyBetweenMsImages(
             info.size.width, info.size.height, new_backing->num_samples, info.pixel_format,
             backing->num_samples > 1, backing->image, new_backing->image);
 
-        // Update current layout in tracker to new backings layout
+        // Track the layout of the new backing image
         new_backing->state.layout = dst_layout;
         new_backing->state.access_mask = dst_access;
         new_backing->state.pl_stage = dst_stage;
@@ -679,24 +757,67 @@ void Runtime::SetBackingSamples(VideoCore::Image* image, u32 num_samples, bool c
 
 bool Runtime::IsBufferAccessed(const VideoCore::Buffer* handle, u64 offset, u64 size,
                                bool check_read_access) {
-    const AddressRange range = {
-        .resource = reinterpret_cast<u64>(handle),
-        .range_start = offset,
-        .range_end = offset + size - 1,
-    };
-    bool has_access = barrier_tracker.FindRange(range, Access::Write);
+    if (!access_bitmap_on) {
+        return IsBufferAccessedList(handle, offset, size, check_read_access);
+    }
+    const bool has_access = IsBufferAccessedBitmap(handle, offset, size, check_read_access);
+    if (access_bitmap_verify) {
+        ++access_bitmap_checks;
+        if (has_access != IsBufferAccessedList(handle, offset, size, check_read_access)) {
+            Common::PerfStats::Add(Common::PerfStats::Id::AccessBitmapMismatches);
+            if (++access_bitmap_mismatches <= 32) {
+                LOG_ERROR(Render_Vulkan,
+                          "access_bitmap_tracking verify: buffer {:#x} [{:#x}, {:#x}) read check {} "
+                          "gives {} on the bitmap",
+                          handle->CpuAddr(), offset, offset + size, check_read_access, has_access);
+            }
+        }
+        if (access_bitmap_checks % 1000000 == 0) {
+            LOG_WARNING(Render_Vulkan, "access_bitmap_tracking verify: {} checks, {} mismatches",
+                        access_bitmap_checks, access_bitmap_mismatches);
+        }
+    }
+    return has_access;
+}
+
+bool Runtime::IsBufferAccessedBitmap(const VideoCore::Buffer* handle, u64 offset, u64 size,
+                                     bool check_read_access) {
+    BufferBitmaps* bitmaps = FindBitmaps(handle, false);
+    if (!bitmaps) {
+        return false;
+    }
+    bool hit;
+    bool has_access = bitmaps->writes.Overlaps(offset, offset + size, hit);
+    bool any_hit = hit;
     if (check_read_access && !has_access) {
-        has_access |= barrier_tracker.FindRange(range, Access::Read);
+        has_access = bitmaps->reads.Overlaps(offset, offset + size, hit);
+        any_hit |= hit;
+    }
+    if (any_hit) {
+        Common::PerfStats::Add(Common::PerfStats::Id::AccessBitmapHits);
+        if (!has_access) {
+            Common::PerfStats::Add(Common::PerfStats::Id::AccessBitmapFalseHits);
+        }
+    }
+    return has_access;
+}
+
+bool Runtime::IsBufferAccessedList(const VideoCore::Buffer* handle, u64 offset, u64 size,
+                                   bool check_read_access) {
+    MakeCurrent(handle);
+    bool has_access = resource->write_ranges.Overlaps(offset, offset + size);
+    if (check_read_access && !has_access) {
+        has_access |= resource->read_ranges.Overlaps(offset, offset + size);
     }
     return has_access;
 }
 
 void Runtime::AccessBuffer(const VideoCore::Buffer* handle, u64 offset, u64 size,
-                           vk::PipelineStageFlags2 src_stage, vk::AccessFlags2 src_access) {
-    const AddressRange range = {
-        .resource = reinterpret_cast<u64>(handle),
-        .range_start = offset,
-        .range_end = offset + size - 1,
+                           vk::PipelineStageFlags2 src_stage, vk::AccessFlags2 src_access,
+                           bool game_dispatch) {
+    const Interval range = {
+        .start = offset,
+        .end = offset + size,
     };
 
     constexpr static vk::AccessFlags2 READ_MASK =
@@ -711,18 +832,51 @@ void Runtime::AccessBuffer(const VideoCore::Buffer* handle, u64 offset, u64 size
         vk::AccessFlagBits2::eDepthStencilAttachmentWrite | vk::AccessFlagBits2::eTransferWrite |
         vk::AccessFlagBits2::eMemoryWrite | vk::AccessFlagBits2::eTransformFeedbackWriteEXT;
 
-    if (src_access & WRITE_MASK) {
-        barrier_tracker.InsertRange(range, Access::Write);
+    if (access_bitmap_on) {
+        BufferBitmaps* bitmaps = FindBitmaps(handle, true);
+        if (src_access & WRITE_MASK) {
+            bitmaps->writes.Add(range.start, range.end);
+        }
+        if (src_access & READ_MASK) {
+            bitmaps->reads.Add(range.start, range.end);
+        }
     }
-    if (src_access & READ_MASK) {
-        barrier_tracker.InsertRange(range, Access::Read);
+    if (!access_bitmap_on || access_bitmap_verify) {
+        MakeCurrent(handle);
+        if (src_access & WRITE_MASK) {
+            resource->write_ranges.Add(range);
+        }
+        if (src_access & READ_MASK) {
+            resource->read_ranges.Add(range);
+        }
     }
 
     memory_barrier.srcStageMask |= src_stage;
     memory_barrier.srcAccessMask |= src_access & WRITE_MASK;
+    foreign_access |= !game_dispatch;
 }
 
-void Runtime::FlushBarriers() {
+void Runtime::OnGameSync(u8 ring) {
+    // Before any access, the barrier the next hit records covers only
+    // accesses made after the packet
+    if (memory_barrier.srcStageMask) {
+        synced_rings |= static_cast<u16>(1u << ring);
+    }
+}
+
+void Runtime::FlushBarriers(s8 unordered_ring) {
+    if (unordered_ring >= 0) {
+        Common::PerfStats::Add(Common::PerfStats::Id::GcnUnorderedPoints);
+        // Skip barriers only for dispatches the guest left unordered on this ring
+        // Emulator operations, draws and accesses ordered by a guest
+        // sync still need barriers
+        // Keep the accesses tracked so the next barrier covers them
+        if (memory_barrier.srcStageMask && image_barriers.empty() && !foreign_access &&
+            (synced_rings & (1u << unordered_ring)) == 0) {
+            Common::PerfStats::Add(Common::PerfStats::Id::GcnUnorderedSkips);
+            return;
+        }
+    }
     vk::DependencyInfo dep_info{};
 
     if (memory_barrier.srcStageMask) {
@@ -744,9 +898,76 @@ void Runtime::FlushBarriers() {
 
     memory_barrier.srcStageMask = vk::PipelineStageFlagBits2::eNone;
     memory_barrier.srcAccessMask = vk::AccessFlagBits2::eNone;
+    foreign_access = false;
+    synced_rings = 0;
 
     image_barriers.clear();
-    barrier_tracker.Clear();
+    for (auto& resource : resources) {
+        resource.read_ranges.Clear();
+        resource.write_ranges.Clear();
+    }
+    resources.clear();
+    resource = nullptr;
+    ClearBitmaps();
+}
+
+void Runtime::MakeCurrent(const VideoCore::Buffer* handle) {
+    if (resource && resource->handle == handle) {
+        return;
+    }
+    auto it = std::ranges::find(resources, handle, &BufferBarriers::handle);
+    if (it != resources.end()) {
+        resource = std::addressof(*it);
+        return;
+    }
+    resource = &resources.emplace_back(handle);
+}
+
+Runtime::BufferBitmaps* Runtime::FindBitmaps(const VideoCore::Buffer* handle, bool create) {
+    if (bitmap_resource && bitmap_resource->handle == handle) {
+        return bitmap_resource;
+    }
+    for (const auto& bitmaps : bitmap_resources) {
+        if (bitmaps->handle == handle) {
+            bitmap_resource = bitmaps.get();
+            return bitmap_resource;
+        }
+    }
+    if (!create) {
+        return nullptr;
+    }
+    const u64 size = handle->SizeBytes();
+    const auto it = std::ranges::find_if(
+        bitmap_free, [size](const auto& bitmaps) { return bitmaps->reads.SizeBytes() == size; });
+    if (it != bitmap_free.end()) {
+        bitmap_resources.push_back(std::move(*it));
+        bitmap_free.erase(it);
+    } else {
+        bitmap_resources.push_back(std::make_unique<BufferBitmaps>(size));
+    }
+    bitmap_resource = bitmap_resources.back().get();
+    bitmap_resource->handle = handle;
+    return bitmap_resource;
+}
+
+void Runtime::ClearBitmaps() {
+    for (auto& bitmaps : bitmap_resources) {
+        bitmaps->reads.Clear();
+        bitmaps->writes.Clear();
+        bitmaps->handle = nullptr;
+        bitmap_free.push_back(std::move(bitmaps));
+    }
+    bitmap_resources.clear();
+    bitmap_resource = nullptr;
+    // Buffers of sizes that stop coming back would keep their bitmaps
+    // (4 MiB for a 4 GiB arena)
+    constexpr std::size_t MaxFree = 16;
+    if (bitmap_free.size() > MaxFree) {
+        bitmap_free.erase(bitmap_free.begin(), bitmap_free.end() - MaxFree);
+    }
+    // The key switches here, with the bitmaps and the interval lists empty
+    access_bitmap_on =
+        access_bitmap_tracking && Common::PerfStats::AbToggleOn(access_bitmap_toggle);
 }
 
 } // namespace Vulkan

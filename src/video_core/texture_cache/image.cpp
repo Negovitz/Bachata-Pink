@@ -1,8 +1,14 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <array>
+#include <atomic>
+#include <mutex>
 #include <ranges>
 #include "common/assert.h"
+#include "common/logging/events.h"
+#include "common/perf_stats.h"
+#include "core/emulator_settings.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_runtime.h"
@@ -100,11 +106,133 @@ void UniqueImage::Destroy() {
     }
 }
 
-void UniqueImage::Create(const vk::ImageCreateInfo& image_ci) {
-    this->image_ci = image_ci;
-    ASSERT(!image);
+namespace {
+// Keep one VMA pool per memory type for the small images handled by image_memory_pool
+// Custom pool allocations stay inside those blocks instead of using dedicated memory
+// Creating or freeing these images can then avoid repeated vkAllocateMemory and vkFreeMemory calls
+// The pool supplies the backing memory while each image still follows its normal lifetime
+constexpr VkDeviceSize PooledImageMaxBytes = 16ULL << 20;
+// 32 MB blocks: a partly used block holds less VRAM than a 64 MB one, and
+// a new block costs ~0.2 ms
+constexpr VkDeviceSize ImagePoolBlockBytes = 32ULL << 20;
+std::mutex image_pools_mutex;
+std::array<VmaPool, VK_MAX_MEMORY_TYPES> image_pools{};
+
+VmaPool ImagePool(VmaAllocator allocator, u32 memory_type_bits) {
+    // VMA AUTO usages need image information to choose memory, so use the device-local choice they
+    // would make for these pooled images
+    const VmaAllocationCreateInfo type_ci = {
+        .usage = VMA_MEMORY_USAGE_UNKNOWN,
+        .requiredFlags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+    };
+    u32 type_index{};
+    if (vmaFindMemoryTypeIndex(allocator, memory_type_bits, &type_ci, &type_index) != VK_SUCCESS) {
+        return VK_NULL_HANDLE;
+    }
+    std::scoped_lock lk{image_pools_mutex};
+    auto& pool = image_pools[type_index];
+    if (!pool) {
+        const VmaPoolCreateInfo pool_ci = {
+            .memoryTypeIndex = type_index,
+            .blockSize = ImagePoolBlockBytes,
+        };
+        if (vmaCreatePool(allocator, &pool_ci, &pool) != VK_SUCCESS) {
+            pool = VK_NULL_HANDLE;
+        }
+    }
+    return pool;
+}
+} // Anonymous namespace
+
+bool UniqueImage::TryCreatePooled(const vk::ImageCreateInfo& image_ci, bool texture) {
+    static const bool enabled = [] {
+        const bool on = EmulatorSettings.IsImageMemoryPool();
+        if (on) {
+            LOG_WARNING(Render_Vulkan, "Workaround image_memory_pool enabled");
+        }
+        return on;
+    }();
+    // Allocate large textures separately so freed space is not trapped
+    // in partly used pool blocks
+    static const VkDeviceSize texture_max_bytes = [] {
+        const u32 max_kb = EmulatorSettings.GetImagePoolTextureMaxKb();
+        if (max_kb != 0 && EmulatorSettings.IsImageMemoryPool()) {
+            LOG_WARNING(Render_Vulkan, "Workaround image_pool_texture_max_kb enabled: {} KiB",
+                        max_kb);
+        }
+        return VkDeviceSize{max_kb} << 10;
+    }();
+    static const bool follows_toggle = Common::PerfStats::AbToggleFollows("image_memory_pool");
+    if (!enabled || !Common::PerfStats::AbToggleOn(follows_toggle)) {
+        return false;
+    }
+    const auto give_up = [](const char* reason) {
+        static std::atomic<u32> reported{};
+        if (reported.fetch_add(1) < 8) {
+            LOG_WARNING(Render_Vulkan, "image_memory_pool: not pooled ({})", reason);
+        }
+        return false;
+    };
+    // A moved-from UniqueImage no longer owns a device, so leave it without a device to use during
+    // cleanup
+    if (!device) {
+        return give_up("no device");
+    }
+    auto [create_result, new_image] = device.createImage(image_ci);
+    if (create_result != vk::Result::eSuccess) {
+        return give_up("createImage");
+    }
+    const auto requirements = device.getImageMemoryRequirements(new_image);
+    if (texture && texture_max_bytes != 0 && requirements.size > texture_max_bytes) {
+        // Create() gives it an allocation of its own
+        device.destroyImage(new_image);
+        return false;
+    }
+    const VmaPool pool = requirements.size <= PooledImageMaxBytes
+                             ? ImagePool(allocator, requirements.memoryTypeBits)
+                             : VK_NULL_HANDLE;
+    if (!pool) {
+        device.destroyImage(new_image);
+        return requirements.size <= PooledImageMaxBytes ? give_up("no pool") : false;
+    }
     const VmaAllocationCreateInfo alloc_ci = {
         .flags = VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT,
+        .pool = pool,
+    };
+    VmaAllocationInfo alloc_info{};
+    if (vmaAllocateMemoryForImage(allocator, static_cast<VkImage>(new_image), &alloc_ci,
+                                  &allocation, &alloc_info) != VK_SUCCESS) {
+        device.destroyImage(new_image);
+        allocation = {};
+        return give_up("pool allocation");
+    }
+    if (vmaBindImageMemory(allocator, allocation, static_cast<VkImage>(new_image)) != VK_SUCCESS) {
+        vmaFreeMemory(allocator, allocation);
+        device.destroyImage(new_image);
+        allocation = {};
+        return false;
+    }
+    Common::PerfStats::Add(Common::PerfStats::Id::PooledImages);
+    image = new_image;
+    size_bytes = alloc_info.size;
+    return true;
+}
+
+void UniqueImage::Create(const vk::ImageCreateInfo& image_ci, bool texture) {
+    this->image_ci = image_ci;
+    ASSERT(!image);
+    if (TryCreatePooled(image_ci, texture)) {
+        return;
+    }
+    // Keep this texture out of VMA's default pools too, since they also
+    // retain partly used blocks
+    static const bool own_textures =
+        EmulatorSettings.IsImageMemoryPool() && EmulatorSettings.GetImagePoolTextureMaxKb() != 0;
+    const bool own = texture && own_textures;
+    const VmaAllocationCreateInfo alloc_ci = {
+        .flags = static_cast<VmaAllocationCreateFlags>(
+            VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT |
+            (own ? VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT : 0)),
         .usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE,
         .requiredFlags = 0,
         .preferredFlags = 0,
@@ -117,14 +245,20 @@ void UniqueImage::Create(const vk::ImageCreateInfo& image_ci) {
     VmaAllocationInfo alloc_info{};
     VkResult result = vmaCreateImage(allocator, &image_ci_unsafe, &alloc_ci, &unsafe_image,
                                      &allocation, &alloc_info);
-    ASSERT_MSG(result == VK_SUCCESS, "Failed allocating image with error {}",
-               vk::to_string(vk::Result{result}));
+    // Print the image description so an implausible (garbage T#) request is diagnosable
+    ASSERT_MSG(result == VK_SUCCESS,
+               "Failed allocating image with error {}: {}x{}x{} layers={} levels={} samples={} "
+               "format={}",
+               vk::to_string(vk::Result{result}), image_ci.extent.width, image_ci.extent.height,
+               image_ci.extent.depth, image_ci.arrayLayers, image_ci.mipLevels,
+               vk::to_string(image_ci.samples), vk::to_string(image_ci.format));
     image = vk::Image{unsafe_image};
     size_bytes = alloc_info.size;
 }
 
 Image::Image(const Vulkan::Instance& instance, Vulkan::Runtime& runtime_,
-             Common::SlotVector<ImageView>& slot_image_views_, const ImageInfo& info_)
+             Common::SlotVector<ImageView>& slot_image_views_, const ImageInfo& info_,
+             bool texture)
     : runtime{&runtime_}, slot_image_views{&slot_image_views_}, info{info_} {
     if (info.pixel_format == vk::Format::eUndefined) {
         return;
@@ -165,9 +299,10 @@ Image::Image(const Vulkan::Instance& instance, Vulkan::Runtime& runtime_,
     const auto image_format_properties =
         instance.GetPhysicalDevice().getImageFormatProperties2(format_info);
     if (image_format_properties.result == vk::Result::eErrorFormatNotSupported) {
-        LOG_ERROR(Render_Vulkan, "image format {} type {} is not supported (flags {}, usage {})",
-                  vk::to_string(supported_format), vk::to_string(format_info.type),
-                  vk::to_string(format_info.flags), vk::to_string(format_info.usage));
+        LOG_RENDER_PROBLEM(Render_Vulkan, Error,
+                           "image format {} type {} is not supported (flags {}, usage {})",
+                           vk::to_string(supported_format), vk::to_string(format_info.type),
+                           vk::to_string(format_info.flags), vk::to_string(format_info.usage));
     }
     supported_samples = image_format_properties.result == vk::Result::eSuccess
                             ? image_format_properties.value.imageFormatProperties.sampleCounts
@@ -193,7 +328,7 @@ Image::Image(const Vulkan::Instance& instance, Vulkan::Runtime& runtime_,
     backing = &backing_images.emplace_back();
     backing->num_samples = info.num_samples;
     backing->image = UniqueImage{instance.GetDevice(), instance.GetAllocator()};
-    backing->image.Create(image_ci);
+    backing->image.Create(image_ci, texture);
 
     Vulkan::SetObjectName(instance.GetDevice(), GetImage(),
                           "Image {}x{}x{} {} {} {:#x}:{:#x} L:{} M:{} S:{}", info.size.width,
@@ -223,107 +358,9 @@ ImageView& Image::FindView(const ImageViewInfo& view_info, bool ensure_guest_sam
 void Image::GetBarriers(Barriers& barriers, vk::ImageLayout dst_layout, vk::AccessFlags2 dst_mask,
                         vk::PipelineStageFlags2 dst_stage,
                         std::optional<SubresourceRange> subres_range) {
-    auto& last_state = backing->state;
-    auto& subresource_states = backing->subresource_states;
-
-    const bool needs_partial_transition =
-        subres_range &&
-        (subres_range->base != SubresourceBase{} || subres_range->extent != info.resources);
-    const bool partially_transited = !subresource_states.empty();
-
-    if (needs_partial_transition || partially_transited) {
-        if (!partially_transited) {
-            subresource_states.resize(info.resources.levels * info.resources.layers);
-            std::fill(subresource_states.begin(), subresource_states.end(), last_state);
-        }
-
-        // In case of partial transition, we need to change the specified subresources only.
-        // Otherwise all subresources need to be set to the same state so we can use a full
-        // resource transition for the next time.
-        const auto mips =
-            needs_partial_transition
-                ? std::ranges::views::iota(subres_range->base.level,
-                                           subres_range->base.level + subres_range->extent.levels)
-                : std::views::iota(0u, info.resources.levels);
-        const auto layers =
-            needs_partial_transition
-                ? std::ranges::views::iota(subres_range->base.layer,
-                                           subres_range->base.layer + subres_range->extent.layers)
-                : std::views::iota(0u, info.resources.layers);
-
-        for (u32 mip : mips) {
-            for (u32 layer : layers) {
-                // NOTE: these loops may produce a lot of small barriers.
-                // If this becomes a problem, we can optimize it by merging adjacent barriers.
-                const auto subres_idx = mip * info.resources.layers + layer;
-                ASSERT(subres_idx < subresource_states.size());
-                auto& state = subresource_states[subres_idx];
-
-                constexpr auto write_flags = vk::AccessFlagBits2::eTransferWrite |
-                                             vk::AccessFlagBits2::eShaderWrite |
-                                             vk::AccessFlagBits2::eMemoryWrite;
-                const bool is_write = static_cast<bool>(state.access_mask & write_flags);
-                if (state.layout != dst_layout || state.access_mask != dst_mask || is_write) {
-                    barriers.emplace_back(vk::ImageMemoryBarrier2{
-                        .srcStageMask = state.pl_stage,
-                        .srcAccessMask = state.access_mask,
-                        .dstStageMask = dst_stage,
-                        .dstAccessMask = dst_mask,
-                        .oldLayout = state.layout,
-                        .newLayout = dst_layout,
-                        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-                        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-                        .image = GetImage(),
-                        .subresourceRange{
-                            .aspectMask = aspect_mask,
-                            .baseMipLevel = mip,
-                            .levelCount = 1,
-                            .baseArrayLayer = layer,
-                            .layerCount = 1,
-                        },
-                    });
-                    state.layout = dst_layout;
-                    state.access_mask = dst_mask;
-                    state.pl_stage = dst_stage;
-                }
-            }
-        }
-
-        if (!needs_partial_transition) {
-            subresource_states.clear();
-        }
-    } else { // Full resource transition
-        constexpr auto write_flags = vk::AccessFlagBits2::eTransferWrite |
-                                     vk::AccessFlagBits2::eShaderWrite |
-                                     vk::AccessFlagBits2::eMemoryWrite;
-        const bool is_write = static_cast<bool>(last_state.access_mask & write_flags);
-        if (last_state.layout == dst_layout && last_state.access_mask == dst_mask && !is_write) {
-            return;
-        }
-
-        barriers.emplace_back(vk::ImageMemoryBarrier2{
-            .srcStageMask = last_state.pl_stage,
-            .srcAccessMask = last_state.access_mask,
-            .dstStageMask = dst_stage,
-            .dstAccessMask = dst_mask,
-            .oldLayout = last_state.layout,
-            .newLayout = dst_layout,
-            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-            .image = GetImage(),
-            .subresourceRange{
-                .aspectMask = aspect_mask,
-                .baseMipLevel = 0,
-                .levelCount = VK_REMAINING_MIP_LEVELS,
-                .baseArrayLayer = 0,
-                .layerCount = VK_REMAINING_ARRAY_LAYERS,
-            },
-        });
-    }
-
-    last_state.layout = dst_layout;
-    last_state.access_mask = dst_mask;
-    last_state.pl_stage = dst_stage;
+    GetImageBarriers(GetImage(), aspect_mask, info.resources, backing->state,
+                     backing->subresource_states, barriers, dst_layout, dst_mask, dst_stage,
+                     subres_range);
 }
 
 } // namespace VideoCore

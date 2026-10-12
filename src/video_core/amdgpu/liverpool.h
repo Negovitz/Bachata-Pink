@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <chrono>
 #include <condition_variable>
 #include <coroutine>
 #include <exception>
@@ -191,6 +192,8 @@ private:
     Task ProcessCompute(std::span<const u32> acb, u32 vqid);
 
     void ProcessCommands();
+    /// Perf stats: a label written by the submission `qid` is processing (label_lag_ms)
+    void RecordLabelLag(u32 qid);
     void Process(std::stop_token stoken);
 
     struct GpuQueue {
@@ -200,6 +203,8 @@ private:
         std::vector<u32> dcb_buffer;
         std::vector<u32> ccb_buffer;
         std::queue<Task::Handle> submits{};
+        // With SHADPS4_PERF_STATS: when the guest submitted each entry of `submits`
+        std::queue<std::chrono::steady_clock::time_point> submit_times{};
         ComputeProgram cs_state{};
     };
     std::array<GpuQueue, NumTotalQueues> mapped_queues{};
@@ -243,5 +248,20 @@ private:
 #endif
     s32 curr_qid{-1};
 };
+
+/// Recent PM4 packets and guest submits used by SHADPS4_CBUF_PROBE
+namespace CpHistory {
+enum Queue : s16 { Ce = -2, De = -1 }; // >= 0: ASC vqid
+/// Set once during static initialization, so a hook costs a load and a branch when the probe is off
+extern const bool enabled;
+[[nodiscard]] inline bool Enabled() {
+    return enabled;
+}
+/// `packet` runs from the packet header to the end of the submission
+void RecordPacket(s16 queue, std::span<const u32> packet);
+void RecordSubmit(s16 queue, std::span<const u32> commands);
+/// Logs the last `count` entries, oldest first
+void Dump(u32 count);
+} // namespace CpHistory
 
 } // namespace AmdGpu

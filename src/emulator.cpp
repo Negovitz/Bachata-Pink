@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <cstdlib>
 #include <ctime>
 #include <filesystem>
 #include <fstream>
@@ -22,6 +23,7 @@
 #include "common/discord_rpc_handler.h"
 #endif
 #include "common/elf_info.h"
+#include "common/logging/events.h"
 #include "common/memory_patcher.h"
 #include "common/ntapi.h"
 #include "common/path_util.h"
@@ -89,6 +91,7 @@ void Emulator::Shutdown() {
     if (exit_done) {
         return;
     }
+    Common::Log::PrintSessionSummary();
     Common::Log::Flush();
     Libraries::SaveData::Backup::StopThread();
     Storage::DataBase::Instance().Close();
@@ -441,6 +444,17 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
                                                                           : "shad_log.txt",
                         append_log);
 #ifdef _WIN32
+    // H1: cpu_affinity_mask pins the process (its current threads and every thread it creates), not a
+    // thread: pinning the command processor to one core was 5-12 ms per frame slower in SotC
+    if (const u64 mask = EmulatorSettings.GetCpuAffinityMask(); mask != 0) {
+        if (SetProcessAffinityMask(GetCurrentProcess(), static_cast<DWORD_PTR>(mask))) {
+            LOG_WARNING(Core, "Workaround cpu_affinity_mask: process affinity {:#x}", mask);
+        } else {
+            LOG_ERROR(Core, "cpu_affinity_mask {:#x} rejected: {}", mask, GetLastError());
+        }
+    }
+#endif
+#ifdef _WIN32
     // Windows static guest red-zone protection
     if (WindowsGuestRedZoneProtection::IsStaticPatchingEnabled()) {
         LOG_INFO(Core,
@@ -574,18 +588,19 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
     std::string remote_host = Common::GetRemoteNameFromLink();
     if (Common::g_is_release) {
         if (remote_host == "shadps4-emu" || remote_url.length() == 0) {
-            window_title = fmt::format("shadPS4 v{} | {}", Common::g_version, game_title);
+            window_title = fmt::format("Pink-shadPS4 v{} | {}", Common::g_version, game_title);
         } else {
-            window_title =
-                fmt::format("shadPS4 {}/v{} | {}", remote_host, Common::g_version, game_title);
+            window_title = fmt::format("Pink-shadPS4 {}/v{} | {}", remote_host, Common::g_version,
+                                       game_title);
         }
     } else {
         if (remote_host == "shadps4-emu" || remote_url.length() == 0) {
-            window_title = fmt::format("shadPS4 v{} {} {} | {}", Common::g_version,
+            window_title = fmt::format("Pink-shadPS4 v{} {} {} | {}", Common::g_version,
                                        Common::g_scm_branch, Common::g_scm_desc, game_title);
         } else {
-            window_title = fmt::format("shadPS4 v{} {}/{} {} | {}", Common::g_version, remote_host,
-                                       Common::g_scm_branch, Common::g_scm_desc, game_title);
+            window_title =
+                fmt::format("Pink-shadPS4 v{} {}/{} {} | {}", Common::g_version, remote_host,
+                            Common::g_scm_branch, Common::g_scm_desc, game_title);
         }
     }
     window = std::make_unique<Frontend::WindowSDL>(EmulatorSettings.GetWindowWidth(),
@@ -620,9 +635,29 @@ void Emulator::Run(std::filesystem::path file, std::vector<std::string> args,
     }
     mnt->Mount(mount_download_dir, "/download0");
 
-    const auto& mount_captures_dir = Common::FS::GetUserPath(Common::FS::PathType::CapturesDir);
+    if (EmulatorSettings.IsRedirectApp0Logs()) {
+        // Only /app0/logs becomes writable; the rest of /app0 stays read-only.
+        const auto mount_game_logs_dir =
+            Common::FS::GetUserPath(Common::FS::PathType::UserDir) / "game_logs" / id;
+        std::error_code ec;
+        std::filesystem::create_directories(mount_game_logs_dir, ec);
+        if (ec) {
+            LOG_ERROR(Loader, "Could not create {} for /app0/logs: {}",
+                      mount_game_logs_dir.string(), ec.message());
+        } else {
+            LOG_WARNING(Loader, "Workaround redirect_app0_logs: /app0/logs -> {}",
+                        mount_game_logs_dir.string());
+            mnt->Mount(mount_game_logs_dir, "/app0/logs");
+        }
+    }
+
+    // SHADPS4_RDOC_CAPTURE_DIR moves RenderDoc captures off the user dir (they can be GBs)
+    const char* capture_dir_env = std::getenv("SHADPS4_RDOC_CAPTURE_DIR");
+    const std::filesystem::path mount_captures_dir =
+        capture_dir_env ? std::filesystem::path{capture_dir_env}
+                        : Common::FS::GetUserPath(Common::FS::PathType::CapturesDir);
     if (!std::filesystem::exists(mount_captures_dir)) {
-        std::filesystem::create_directory(mount_captures_dir);
+        std::filesystem::create_directories(mount_captures_dir);
     }
     VideoCore::SetOutputDir(mount_captures_dir, id);
 

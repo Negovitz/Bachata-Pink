@@ -309,15 +309,21 @@ void EmitContext::DefineWorkgroupIndex() {
 }
 
 void EmitContext::DefineInputs() {
+    // Subgroup integer inputs are Flat only in fragment shaders
+    const bool flat_subgroup_inputs = sw_stage == SwStage::Fragment;
     if (info.uses_lane_id) {
         subgroup_local_invocation_id = DefineVariable(
             U32[1], spv::BuiltIn::SubgroupLocalInvocationId, spv::StorageClass::Input);
-        Decorate(subgroup_local_invocation_id, spv::Decoration::Flat);
+        if (flat_subgroup_inputs) {
+            Decorate(subgroup_local_invocation_id, spv::Decoration::Flat);
+        }
     }
     if (info.loads.GetAny(IR::Attribute::SubgroupLtMask)) {
         subgroup_lt_mask =
             DefineVariable(U32[4], spv::BuiltIn::SubgroupLtMask, spv::StorageClass::Input);
-        Decorate(subgroup_lt_mask, spv::Decoration::Flat);
+        if (flat_subgroup_inputs) {
+            Decorate(subgroup_lt_mask, spv::Decoration::Flat);
+        }
     }
     switch (sw_stage) {
     case SwStage::Vertex: {
@@ -332,21 +338,22 @@ void EmitContext::DefineInputs() {
                 DefineVariable(U32[1], spv::BuiltIn::BaseInstance, spv::StorageClass::Input);
         }
 
-        const auto fetch_shader = Gcn::ParseFetchShader(info);
-        if (!fetch_shader) {
+        Shader::Gcn::FetchShaderData fetch_shader;
+        if (!Gcn::ParseFetchShader(info, fetch_shader)) {
             break;
         }
-        for (const auto& attrib : fetch_shader->attributes) {
-            ASSERT(attrib.semantic < IR::NumParams);
+        ASSERT(fetch_shader.attributes.size() <= IR::NumParams);
+        for (u32 semantic = 0; semantic < fetch_shader.attributes.size(); ++semantic) {
+            const auto& attrib = fetch_shader.attributes[semantic];
             const auto sharp = attrib.GetSharp(info);
             const Id type{GetAttributeType(*this, sharp.GetNumberFmt())[4]};
-            Id id{DefineInput(type, attrib.semantic)};
+            Id id{DefineInput(type, semantic)};
             if (attrib.GetStepRate() != Gcn::VertexAttribute::InstanceIdType::None) {
-                Name(id, fmt::format("vs_instance_attr{}", attrib.semantic));
+                Name(id, fmt::format("vs_instance_attr{}", semantic));
             } else {
-                Name(id, fmt::format("vs_in_attr{}", attrib.semantic));
+                Name(id, fmt::format("vs_in_attr{}", semantic));
             }
-            input_params[attrib.semantic] = GetAttributeInfo(sharp.GetNumberFmt(), id, 4, false);
+            input_params[semantic] = GetAttributeInfo(sharp.GetNumberFmt(), id, 4, false);
         }
         break;
     }
@@ -837,6 +844,9 @@ EmitContext::BufferSpv EmitContext::DefineBuffer(bool is_written, bool is_cohere
     case BufferType::FaultBuffer:
         Name(id, "fault_buffer");
         break;
+    case BufferType::LoopCapBuffer:
+        Name(id, "loop_cap_buffer");
+        break;
     case BufferType::SharedMemory:
         Name(id, "ssbo_shmem");
         break;
@@ -863,6 +873,8 @@ void EmitContext::DefineBuffers() {
             bda_pagetable_index = buffers.size();
         } else if (desc.buffer_type == BufferType::FaultBuffer) {
             fault_buffer_index = buffers.size();
+        } else if (desc.buffer_type == BufferType::LoopCapBuffer) {
+            loop_cap_buffer_index = buffers.size();
         }
 
         // Define aliases depending on the shader usage.
@@ -1005,7 +1017,8 @@ void EmitContext::DefineImagesAndSamplers() {
 
         const u32 num_bindings = image_desc.NumBindings(info);
         Id pointee_type = image_type;
-        if (mip_fallback_mode == MipStorageFallbackMode::DynamicIndex) {
+        if (mip_fallback_mode == MipStorageFallbackMode::DynamicIndex ||
+            image_desc.array_size != 0) {
             pointee_type = TypeArray(pointee_type, ConstU32(num_bindings));
         }
 
@@ -1024,6 +1037,7 @@ void EmitContext::DefineImagesAndSamplers() {
             .is_integer = is_integer,
             .is_storage = is_storage,
             .mip_fallback_mode = mip_fallback_mode,
+            .array_size = image_desc.array_size,
         });
         interfaces.push_back(id);
     }
@@ -1194,6 +1208,9 @@ Id EmitContext::DefineGetBdaPointer() {
     const auto caching_pagebits{Constant(U64, static_cast<u64>(profile.sparse_page_shift))};
     const auto caching_pagemask{
         Constant(U64, static_cast<u64>((1u << profile.sparse_page_shift) - 1))};
+    // Entries of the BDA page table and bits of the fault bitmap: one per sparse page of the 40-bit guest
+    // address space (BufferCache::ADDRESS_SPACE_BITS)
+    const auto caching_numpages{Constant(U64, u64{1} << (40 - profile.sparse_page_shift))};
 
     const auto func_type{TypeFunction(U64, U64)};
     const auto func{OpFunction(U64, spv::FunctionControlMask::MaskNone, func_type)};
@@ -1203,35 +1220,48 @@ Id EmitContext::DefineGetBdaPointer() {
 
     const auto fault_label{OpLabel()};
     const auto available_label{OpLabel()};
+    const auto mark_fault_label{OpLabel()};
+    const auto fault_marked_label{OpLabel()};
     const auto merge_label{OpLabel()};
 
-    // Get page BDA
+    // Get page BDA. A garbage address beyond the page table reads entry 0 and never faults
     const auto page{OpShiftRightLogical(U64, address, caching_pagebits)};
     const auto page32{OpUConvert(U32[1], page)};
+    const auto is_valid_page{OpULessThan(U1[1], page, caching_numpages)};
+    const auto safe_page32{OpSelect(U32[1], is_valid_page, page32, u32_zero_value)};
     const auto& bda_buffer{buffers[bda_pagetable_index]};
     const auto [bda_buffer_id, bda_pointer_type] = bda_buffer.Alias(PointerType::U64);
-    const auto bda_ptr{OpAccessChain(bda_pointer_type, bda_buffer_id, u32_zero_value, page32)};
+    const auto bda_ptr{OpAccessChain(bda_pointer_type, bda_buffer_id, u32_zero_value, safe_page32)};
     const auto bda{OpLoad(U64, bda_ptr)};
 
     // Check if page is GPU cached
-    const auto is_fault{OpIEqual(U1[1], bda, u64_zero_value)};
+    const auto is_available{
+        OpLogicalAnd(U1[1], is_valid_page, OpINotEqual(U1[1], bda, u64_zero_value))};
     OpSelectionMerge(merge_label, spv::SelectionControlMask::MaskNone);
-    OpBranchConditional(is_fault, fault_label, available_label);
+    OpBranchConditional(is_available, available_label, fault_label);
 
-    // First time acces, mark as fault
+    // First time access, mark a fault only when the guest address is representable by the fixed-size BDA page
+    // table and fault bitmap
     AddLabel(fault_label);
+    OpSelectionMerge(fault_marked_label, spv::SelectionControlMask::MaskNone);
+    OpBranchConditional(is_valid_page, mark_fault_label, fault_marked_label);
+
+    AddLabel(mark_fault_label);
     const auto& fault_buffer{buffers[fault_buffer_index]};
     const auto [fault_buffer_id, fault_pointer_type] = fault_buffer.Alias(PointerType::U32);
-    const auto page_div32{OpShiftRightLogical(U32[1], page32, ConstU32(5U))};
-    const auto page_mod32{OpBitwiseAnd(U32[1], page32, ConstU32(31U))};
+    const auto page_div32{OpShiftRightLogical(U32[1], safe_page32, ConstU32(5U))};
+    const auto page_mod32{OpBitwiseAnd(U32[1], safe_page32, ConstU32(31U))};
     const auto page_mask{OpShiftLeftLogical(U32[1], u32_one_value, page_mod32)};
     const auto fault_ptr{
         OpAccessChain(fault_pointer_type, fault_buffer_id, u32_zero_value, page_div32)};
-    const auto fault_value{OpLoad(U32[1], fault_ptr)};
-    const auto fault_value_masked{OpBitwiseOr(U32[1], fault_value, page_mask)};
-    OpStore(fault_ptr, fault_value_masked);
+    // Different invocations can fault pages covered by the same bitmap word. A load/OR/store sequence can
+    // lose one of those faults, so update the shared device buffer atomically
+    const auto device_scope{ConstU32(static_cast<u32>(spv::Scope::Device))};
+    OpAtomicOr(U32[1], fault_ptr, device_scope, u32_zero_value, page_mask);
+    OpBranch(fault_marked_label);
 
     // Return null pointer
+    AddLabel(fault_marked_label);
     const auto fallback_result{u64_zero_value};
     OpBranch(merge_label);
 
@@ -1243,7 +1273,7 @@ Id EmitContext::DefineGetBdaPointer() {
 
     // Merge
     AddLabel(merge_label);
-    const auto result{OpPhi(U64, addr, available_label, fallback_result, fault_label)};
+    const auto result{OpPhi(U64, addr, available_label, fallback_result, fault_marked_label)};
     OpReturnValue(result);
     OpFunctionEnd();
     return func;

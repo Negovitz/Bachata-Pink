@@ -1,11 +1,17 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
+#include <atomic>
+#include <cstddef>
+#include <cstring>
 #include <ranges>
 
 #include "common/hash.h"
 #include "common/io_file.h"
+#include "common/logging/events.h"
 #include "common/path_util.h"
+#include "common/perf_stats.h"
 #include "core/debug_state.h"
 #include "core/emulator_settings.h"
 #include "shader_recompiler/backend/spirv/emit_spirv.h"
@@ -180,6 +186,16 @@ const Shader::RuntimeInfo& PipelineCache::BuildRuntimeInfo(HwStage stage, SwStag
                                (stencil_ref_export_enable << 1) |
                                (regs.depth_shader_control.mask_export_enable << 2) |
                                (regs.depth_shader_control.coverage_to_mask_enable << 3);
+        // Per-game: GCN tests depth/stencil before the pixel shader when Z_ORDER asks for it, so fragments
+        // that fail never run. A Vulkan shader with storage writes needs EarlyFragmentTests for that; without
+        // it the writes of failing fragments land too (SotC deferred decals paint their whole box footprint
+        // into the G-buffer). Not with a depth, stencil ref or sample mask export (mrtz_mask bits 0-2): the
+        // tests need them
+        const auto z_order = regs.depth_shader_control.z_order;
+        info.hw.fs.early_fragment_tests =
+            EmulatorSettings.IsEarlyFragmentTestsFromZOrder() &&
+            (z_order == AmdGpu::ZOrder::EarlyZLateZ || z_order == AmdGpu::ZOrder::EarlyZReZ) &&
+            (info.hw.fs.mrtz_mask & 0b111) == 0;
         const auto& cb0_blend = regs.blend_control[0];
         if (cb0_blend.enable) {
             info.hw.fs.dual_source_blending =
@@ -340,6 +356,8 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
         const auto pipeline_hash = std::hash<GraphicsPipelineKey>{}(graphics_key);
         LOG_INFO(Render_Vulkan, "Compiling graphics pipeline {:#x}", pipeline_hash);
 
+        const Common::PerfStats::ScopedTimer perf_timer{Common::PerfStats::Id::PipelineCreates,
+                                                        Common::PerfStats::Id::PipelineCreateNs};
         GraphicsPipeline::SerializationSupport sdata{};
         it.value() = std::make_unique<GraphicsPipeline>(
             instance, scheduler, desc_heap, profile, graphics_key, *pipeline_cache, infos,
@@ -356,7 +374,6 @@ const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectPar
                 }
             }
         }
-        fetch_shader.reset();
     }
     return it->second.get();
 }
@@ -370,6 +387,8 @@ const ComputePipeline* PipelineCache::GetComputePipeline() {
         const auto pipeline_hash = std::hash<ComputePipelineKey>{}(compute_key);
         LOG_INFO(Render_Vulkan, "Compiling compute pipeline {:#x}", pipeline_hash);
 
+        const Common::PerfStats::ScopedTimer perf_timer{Common::PerfStats::Id::PipelineCreates,
+                                                        Common::PerfStats::Id::PipelineCreateNs};
         ComputePipeline::SerializationSupport sdata{};
         it.value() = std::make_unique<ComputePipeline>(instance, scheduler, desc_heap, profile,
                                                        *pipeline_cache, compute_key, *infos[0],
@@ -486,12 +505,106 @@ bool PipelineCache::RefreshGraphicsKey() {
     return true;
 }
 
+bool PipelineCache::CachedBytesMatch(const u32* code, const CachedBinaryInfo& cached) {
+    // SotC keeps shader code on pages it shares with GPU-written buffers: reading it through the protected
+    // page faults, reads the page back and drains the GPU. Bytes the GPU never wrote already hold their
+    // value in the backing (shader_code_clean_reads)
+    const bool clean = static_cast<bool>(read_clean_memory);
+    const auto* base = reinterpret_cast<const u8*>(code);
+    const u8* expected = cached.bytes.data();
+    for (const auto& [offset, size] : cached.ranges) {
+        const u8* current = base + offset;
+        if (clean) {
+            code_scratch.resize(size);
+            if (read_clean_memory(reinterpret_cast<VAddr>(current), code_scratch.data(), size)) {
+                current = code_scratch.data();
+                Common::PerfStats::Add(Common::PerfStats::Id::ShaderCodeCleanReads);
+            }
+        }
+        if (std::memcmp(current, expected, size) != 0) {
+            return false;
+        }
+        expected += size;
+    }
+    return true;
+}
+
+template <typename Program>
+std::optional<Shader::ShaderParams> PipelineCache::GetParamsCached(const Program& pgm) {
+    const auto* code = pgm.template Address<u32*>();
+    const auto make_params = [&](const AmdGpu::BinaryInfo& info) {
+        return Shader::ShaderParams{
+            .user_data = pgm.user_data,
+            .code = std::span{code, info.length / sizeof(u32)},
+            .hash = info.shader_hash,
+        };
+    };
+    // With shader_code_clean_reads enabled for this game, reuse binary info while the tracked
+    // shader bytes stay unchanged so each draw or dispatch does not repeat the full search
+    const bool cached_search = EmulatorSettings.IsShaderCodeCleanReads();
+    if (cached_search) {
+        if (const auto it = binary_info_cache.find(code);
+            it != binary_info_cache.end() && CachedBytesMatch(code, it->second)) {
+            return make_params(it->second.info);
+        }
+    }
+    // The command processor may read stale state whose program address contains no valid shader
+    // Skip that draw or dispatch instead of aborting, as we already do for rejected texture
+    // descriptors, and limit the warnings because the same bad state may repeat on every draw
+    const auto* found_info = AmdGpu::FindBinaryInfo(code);
+    if (!found_info) {
+        static std::atomic<u32> missing_warnings{0};
+        constexpr u32 MaxMissingWarnings = 32;
+        if (missing_warnings.fetch_add(1, std::memory_order_relaxed) < MaxMissingWarnings) {
+            LOG_RENDER_PROBLEM(Render_Vulkan, Error,
+                               "Shader binary info not found at {}, skipping the command",
+                               fmt::ptr(code));
+        }
+        return std::nullopt;
+    }
+    if (!cached_search) {
+        return make_params(*found_info);
+    }
+    const auto& info = *found_info;
+    auto& cached = binary_info_cache[code];
+    cached.ranges.clear();
+    cached.bytes.clear();
+    // Only the bytes the search read: sizeof(info) includes tail padding past crc32
+    constexpr u32 info_extent = offsetof(AmdGpu::BinaryInfo, crc32) + sizeof(u32);
+    std::memcpy(&cached.info, &info, info_extent);
+    const auto* base = reinterpret_cast<const u8*>(code);
+    const auto add_range = [&](const u8* begin, u32 size) {
+        cached.ranges.emplace_back(static_cast<u64>(begin - base), size);
+        cached.bytes.insert(cached.bytes.end(), begin, begin + size);
+    };
+    // The bytes SearchBinaryInfo read: the header of code starting with s_mov_b32 vcc_hi points at the block,
+    // otherwise the code is scanned up to the block
+    constexpr u32 token_mov_vcchi = 0xBEEB03FF;
+    const auto* found = reinterpret_cast<const u8*>(&info);
+    const auto* header_target =
+        code[0] == token_mov_vcchi ? reinterpret_cast<const u8*>(code + (code[1] + 1) * 2) : nullptr;
+    if (found == header_target) {
+        add_range(base, 2 * sizeof(u32));
+        add_range(found, info_extent);
+    } else {
+        add_range(base, static_cast<u32>(found - base) + info_extent);
+        if (header_target) {
+            // The header pointed at an invalid block; it must stay invalid
+            add_range(header_target, sizeof(AmdGpu::BinaryInfo::signature_ref));
+        }
+    }
+    return make_params(cached.info);
+}
+
 bool PipelineCache::RefreshGraphicsStages() {
     const auto& regs = liverpool->regs;
     auto& key = graphics_key;
-    fetch_shader = std::nullopt;
+    fetch_shader = nullptr;
 
     Shader::Backend::Bindings binding{};
+    // A shader stage with missing binary info makes the whole draw unusable, so remember that
+    // separately from a disabled stage, which simply returns false without invalidating the draw
+    bool missing_code = false;
     const auto bind_stage = [&](HwStage stage_in, SwStage stage_out) -> bool {
         const auto stage_in_idx = static_cast<u32>(stage_in);
         const auto stage_out_idx = static_cast<u32>(stage_out);
@@ -508,14 +621,13 @@ bool PipelineCache::RefreshGraphicsStages() {
             return false;
         }
 
-        const auto params = AmdGpu::GetParams(*pgm);
-        std::optional<Shader::Gcn::FetchShaderData> fetch_shader_;
-        std::tie(infos[stage_out_idx], modules[stage_out_idx], fetch_shader_,
-                 key.stage_hashes[stage_out_idx]) =
-            GetProgram(stage_in, stage_out, params, binding);
-        if (fetch_shader_) {
-            fetch_shader = fetch_shader_;
+        const auto params = GetParamsCached(*pgm);
+        if (!params) {
+            missing_code = true;
+            return false;
         }
+        std::tie(infos[stage_out_idx], modules[stage_out_idx], key.stage_hashes[stage_out_idx]) =
+            GetProgram(stage_in, stage_out, *params, binding);
         return true;
     };
 
@@ -523,6 +635,9 @@ bool PipelineCache::RefreshGraphicsStages() {
     modules.fill(nullptr);
 
     bind_stage(HwStage::Fragment, SwStage::Fragment);
+    if (missing_code) {
+        return false;
+    }
 
     const auto* fs_info = infos[static_cast<u32>(SwStage::Fragment)];
     key.mrt_mask = fs_info ? fs_info->mrt_mask : 0u;
@@ -531,11 +646,13 @@ bool PipelineCache::RefreshGraphicsStages() {
     switch (regs.stage_enable.raw) {
     case AmdGpu::ShaderStageEnable::VgtStages::EsGs:
         if (!instance.IsGeometryStageSupported()) {
-            LOG_WARNING(Render_Vulkan, "Geometry shader stage unsupported, skipping");
+            LOG_RENDER_PROBLEM(Render_Vulkan, Warning,
+                               "Geometry shader stage unsupported, skipping");
             return false;
         }
         if (regs.vgt_gs_mode.onchip || regs.vgt_strmout_config.raw) {
-            LOG_WARNING(Render_Vulkan, "Geometry shader features unsupported, skipping");
+            LOG_RENDER_PROBLEM(Render_Vulkan, Warning,
+                               "Geometry shader features unsupported, skipping");
             return false;
         }
         if (!bind_stage(HwStage::Export, SwStage::Vertex)) {
@@ -564,11 +681,13 @@ bool PipelineCache::RefreshGraphicsStages() {
             return false;
         }
         if (!instance.IsGeometryStageSupported()) {
-            LOG_WARNING(Render_Vulkan, "Geometry shader stage unsupported, skipping");
+            LOG_RENDER_PROBLEM(Render_Vulkan, Warning,
+                               "Geometry shader stage unsupported, skipping");
             return false;
         }
         if (regs.vgt_gs_mode.onchip || regs.vgt_strmout_config.raw) {
-            LOG_WARNING(Render_Vulkan, "Geometry shader features unsupported, skipping");
+            LOG_RENDER_PROBLEM(Render_Vulkan, Warning,
+                               "Geometry shader features unsupported, skipping");
             return false;
         }
         if (!bind_stage(HwStage::Hull, SwStage::TessellationControl)) {
@@ -585,10 +704,13 @@ bool PipelineCache::RefreshGraphicsStages() {
         }
         break;
     case AmdGpu::ShaderStageEnable::VgtStages::Vs:
-        bind_stage(HwStage::Vertex, SwStage::Vertex);
+        if (!bind_stage(HwStage::Vertex, SwStage::Vertex) && missing_code) {
+            return false;
+        }
         break;
     default:
-        LOG_WARNING(Render_Vulkan, "unimplemented shader stage {}", (u32)regs.stage_enable.raw);
+        LOG_RENDER_PROBLEM(Render_Vulkan, Warning, "unimplemented shader stage {}",
+                           (u32)regs.stage_enable.raw);
         return false;
     }
 
@@ -613,21 +735,119 @@ bool PipelineCache::RefreshGraphicsStages() {
 bool PipelineCache::RefreshComputeKey() {
     Shader::Backend::Bindings binding{};
     const auto& cs_pgm = liverpool->GetCsRegs();
-    const auto cs_params = AmdGpu::GetParams(cs_pgm);
-    std::tie(infos[0], modules[0], fetch_shader, compute_key.value) =
-        GetProgram(HwStage::Compute, SwStage::Compute, cs_params, binding);
+    const auto cs_params = GetParamsCached(cs_pgm);
+    if (!cs_params) {
+        return false;
+    }
+    std::tie(infos[0], modules[0], compute_key.value) =
+        GetProgram(HwStage::Compute, SwStage::Compute, *cs_params, binding);
     return true;
 }
 
+namespace {
+
+// Watches one shader compile (only with Log.console_mode = "events"): a recompiler error, or a
+// crash while compiling, marks the shader as broken, which is reported once as a Broken Shader
+// console event. The event points to the GPU.dump_shaders files of the shader when that is on
+class BrokenShaderWatch final : public Common::Log::ErrorScope {
+public:
+    BrokenShaderWatch(Shader::HwStage stage_, u64 hash_, size_t perm_idx_,
+                      std::span<const u32> code_)
+        : stage{stage_}, hash{hash_}, perm_idx{perm_idx_}, code{code_} {}
+
+    void SetSpirv(std::span<const u32> spirv_) {
+        spirv = spirv_;
+    }
+
+    void OnError(Common::Log::Class log_class, Common::Log::Level level,
+                 std::string_view message) override {
+        if (level < Common::Log::Level::Critical &&
+            log_class != Common::Log::Class::Render_Recompiler) {
+            return;
+        }
+        if (errors++ == 0) {
+            first_error = message;
+        }
+    }
+
+    void OnFatal(std::string_view reason) override {
+        Report(first_error.empty() ? reason : first_error, true);
+    }
+
+    // The compile finished without crashing
+    void Finish() {
+        if (errors > 0) {
+            Report(first_error, false);
+        }
+    }
+
+private:
+    // Detail line of the event: where GPU.dump_shaders put the shader (see DumpShader)
+    std::string DumpLocation() const {
+        if (!EmulatorSettings.IsDumpShaders()) {
+            return "not dumped (enable GPU.dump_shaders to keep shader binaries)";
+        }
+        const auto base = Common::FS::GetUserPath(Common::FS::PathType::ShaderDir) / "dumps" /
+                          PipelineCache::GetShaderName(stage, hash, perm_idx);
+        return fmt::format("dump: {}.bin{}", base.string(), spirv.empty() ? "" : " (+ .spv)");
+    }
+
+    void Report(std::string_view reason, bool fatal) {
+        if (reported) {
+            return;
+        }
+        reported = true;
+        if (!Common::Log::FirstTime(fmt::format("broken shader {:#x}", hash))) {
+            return;
+        }
+        std::string message{reason};
+        if (constexpr std::string_view assertion = "Assertion Failed!\n";
+            message.starts_with(assertion)) {
+            message = "assertion failed: " + message.substr(assertion.size());
+        }
+        std::ranges::replace(message, '\n', ' ');
+        const auto perm =
+            perm_idx != 0 ? fmt::format(" (permutation {})", perm_idx) : std::string{};
+        Common::Log::Event(Common::Log::EventKind::BrokenShader,
+                           fmt::format("{} shader {:#018x}{}: {}", stage, hash, perm, message),
+                           {fatal ? "compiling it crashed the emulator"
+                                  : "compiled anyway; draws using it may render wrong",
+                            errors > 1 ? fmt::format("{} more recompiler error{} in the log file",
+                                                     errors - 1, errors > 2 ? "s" : "")
+                                       : std::string{},
+                            DumpLocation()});
+    }
+
+    Shader::HwStage stage;
+    u64 hash;
+    size_t perm_idx;
+    std::span<const u32> code;
+    std::span<const u32> spirv;
+    u32 errors = 0;
+    std::string first_error;
+    bool reported = false;
+};
+
+} // Anonymous namespace
+
 vk::ShaderModule PipelineCache::CompileModule(Shader::Info& info, Shader::RuntimeInfo& runtime_info,
                                               const std::span<const u32>& code, size_t perm_idx,
-                                              Shader::Backend::Bindings& binding) {
+                                              Shader::Backend::Bindings& binding, bool store) {
+    const Common::PerfStats::ScopedTimer perf_timer{Common::PerfStats::Id::ShaderCompiles,
+                                                    Common::PerfStats::Id::ShaderCompileNs};
     LOG_INFO(Render_Vulkan, "Compiling {} shader {:#x} {}", info.hw_stage, info.pgm_hash,
              perm_idx != 0 ? "(permutation)" : "");
     DumpShader(code, info.pgm_hash, info.hw_stage, perm_idx, "bin");
+    std::optional<BrokenShaderWatch> broken_watch;
+    if (Common::Log::EventsEnabled()) {
+        broken_watch.emplace(info.hw_stage, info.pgm_hash, perm_idx, code);
+    }
 
     const auto ir_program = Shader::TranslateProgram(code, pools, info, runtime_info, profile);
     auto spv = Shader::Backend::SPIRV::EmitSPIRV(profile, runtime_info, ir_program, binding);
+    if (broken_watch) {
+        broken_watch->SetSpirv(spv);
+    }
     DumpShader(spv, info.pgm_hash, info.hw_stage, perm_idx, "spv");
 
     vk::ShaderModule module;
@@ -640,8 +860,13 @@ vk::ShaderModule PipelineCache::CompileModule(Shader::Info& info, Shader::Runtim
     } else {
         module = CompileSPV(spv, instance.GetDevice());
     }
+    if (broken_watch) {
+        broken_watch->Finish();
+    }
 
-    RegisterShaderBinary(std::move(spv), info.pgm_hash, perm_idx);
+    if (store) {
+        RegisterShaderBinary(std::move(spv), info.pgm_hash, perm_idx);
+    }
 
     const auto name = GetShaderName(info.hw_stage, info.pgm_hash, perm_idx);
     Vulkan::SetObjectName(instance.GetDevice(), module, name);
@@ -661,14 +886,20 @@ PipelineCache::Result PipelineCache::GetProgram(HwStage hw_stage, SwStage sw_sta
         it_pgm.value() = std::make_unique<Program>(hw_stage, sw_stage, params);
         auto& program = it_pgm.value();
         auto start = binding;
-        const auto module = CompileModule(program->info, runtime_info, params.code, 0, binding);
+        // A permutation can exist on disk even if we did not preload it, so index 0 may already
+        // belong to another shader specialization
+        const size_t perm_idx = Storage::DataBase::Instance().AllocateShaderBinaryIndex(params.hash, 0);
+        const auto module =
+            CompileModule(program->info, runtime_info, params.code, perm_idx, binding);
         auto spec = Shader::StageSpecialization(program->info, runtime_info, profile, start);
-        const auto perm_hash = HashCombine(params.hash, 0);
+        const auto perm_hash = HashCombine(params.hash, perm_idx);
 
-        RegisterShaderMeta(program->info, spec.fetch_shader_data, spec, perm_hash, 0);
-        program->AddPermut(module, std::move(spec));
-        return std::make_tuple(&program->info, module, program->modules[0].spec.fetch_shader_data,
-                               perm_hash);
+        RegisterShaderMeta(program->info, spec.fetch_shader_data, spec, perm_hash, perm_idx);
+        program->InsertPermut(module, std::move(spec), perm_idx);
+        if (auto& fetch = program->modules[perm_idx].spec.fetch_shader_data; !fetch.Empty()) {
+            fetch_shader = &fetch;
+        }
+        return std::make_tuple(&program->info, module, perm_hash);
     }
 
     auto& program = it_pgm.value();
@@ -683,21 +914,59 @@ PipelineCache::Result PipelineCache::GetProgram(HwStage hw_stage, SwStage sw_sta
 
     vk::ShaderModule module{};
 
-    const auto it = std::ranges::find(program->modules, spec, &Program::Module::spec);
-    if (it == program->modules.end()) {
+    auto found = program->FindPermut(spec);
+    // A null texture can reuse any permutation matching the other resources
+    // Run this extra lookup only on a miss because checking builds image descriptions
+    bool null_images = false;
+    if (!found && is_null_image) {
+        auto relaxed = spec;
+        null_images = relaxed.IgnoreNullImages(is_null_image);
+        if (null_images) {
+            found = program->FindPermut(relaxed);
+        }
+        if (found) {
+            static std::atomic<u32> reused{};
+            if (reused.fetch_add(1, std::memory_order_relaxed) == 0) {
+                LOG_WARNING(Render_Vulkan,
+                            "Shader {:#x}: invalid T# bound as null, reusing permutation {} instead "
+                            "of compiling a new one (reported once)",
+                            params.hash, *found);
+            }
+        }
+    }
+    if (!found) {
+        // Choose an index above all permutations in memory and on disk so this compile cannot
+        // overwrite an existing shader binary
+        perm_idx = Storage::DataBase::Instance().AllocateShaderBinaryIndex(
+            params.hash, static_cast<u32>(program->modules.size()));
+        perm_hash = HashCombine(params.hash, perm_idx);
         auto new_info = Shader::Info(hw_stage, sw_stage, params);
-        module = CompileModule(new_info, runtime_info, params.code, perm_idx, binding);
-
-        RegisterShaderMeta(info, spec.fetch_shader_data, spec, perm_hash, perm_idx);
-        program->AddPermut(module, std::move(spec));
+        // Keep permutations based on invalid texture descriptors out of the disk cache
+        // Loading them again would only make shader lookups slower
+        module = CompileModule(new_info, runtime_info, params.code, perm_idx, binding,
+                               !null_images);
+        if (null_images) {
+            static std::atomic<u32> unstored{};
+            if (unstored.fetch_add(1, std::memory_order_relaxed) == 0) {
+                LOG_WARNING(Render_Vulkan,
+                            "Shader {:#x}: new permutation {} with T#s bound as null, not stored "
+                            "in the shader cache (reported once)",
+                            params.hash, perm_idx);
+            }
+        } else {
+            RegisterShaderMeta(info, spec.fetch_shader_data, spec, perm_hash, perm_idx);
+        }
+        program->InsertPermut(module, std::move(spec), perm_idx);
     } else {
         info.AddBindings(binding);
-        module = it->module;
-        perm_idx = std::distance(program->modules.begin(), it);
+        perm_idx = *found;
+        module = program->modules[perm_idx].module;
         perm_hash = HashCombine(params.hash, perm_idx);
     }
-    return std::make_tuple(&program->info, module,
-                           program->modules[perm_idx].spec.fetch_shader_data, perm_hash);
+    if (auto& fetch = program->modules[perm_idx].spec.fetch_shader_data; !fetch.Empty()) {
+        fetch_shader = &fetch;
+    }
+    return std::make_tuple(&program->info, module, perm_hash);
 }
 
 std::optional<vk::ShaderModule> PipelineCache::ReplaceShader(vk::ShaderModule module,
@@ -724,6 +993,8 @@ std::optional<vk::ShaderModule> PipelineCache::ReplaceShader(vk::ShaderModule mo
                 compute_pipelines.erase(compute_key);
             }
         }
+        // A rebuilt pipeline can get the handle of the one just destroyed (gpu_overhead_cuts)
+        scheduler.InvalidatePipelineBinds();
     }
     return new_module;
 }

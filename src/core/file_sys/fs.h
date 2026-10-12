@@ -74,26 +74,21 @@ public:
     void IterateDirectory(std::string_view guest_directory,
                           const IterateDirectoryCallback& callback);
 
-    /// Returns true if the guest path exists in any backend of the
-    /// mount stack. Mirrors fs::exists() on the resolved host path.
+    /// Checks every mounted backend for the guest path
     bool Exists(std::string_view guest_path);
 
-    /// Returns true if the guest path resolves to a directory in any
-    /// backend of the mount stack.
+    /// Checks whether the guest path resolves to a directory
     bool IsDirectory(std::string_view guest_path);
 
-    /// Opens the guest path through the mount's backend stack. Returns
-    /// nullptr when the path does not exist or the caller requested
-    /// writable access on a read-only mount.
+    /// Opens the first matching file in the mount stack
     std::unique_ptr<IFile> Open(std::string_view guest_path, bool writable = false);
-    // Open with an explicit host access mode.
+    // Open with an explicit host access mode
     std::unique_ptr<IFile> Open(std::string_view guest_path, Common::FS::FileAccessMode mode);
 
-    /// Opens a directory through the mount's backend stack.
+    /// Opens a directory through the mount stack
     std::unique_ptr<IDirectory> OpenDir(std::string_view guest_path);
 
-    /// open + read the whole file as bytes. Returns nullopt
-    /// when the file does not exist or is unreadable.
+    /// Reads a whole file or returns null when unavailable
     std::optional<std::vector<u8>> ReadFile(std::string_view guest_path);
 
     const MntPair* GetMountFromHostPath(const std::string& host_path) {
@@ -106,15 +101,17 @@ public:
 
     const MntPair* GetMount(const std::string& guest_path) {
         std::scoped_lock lock{m_mutex};
-        const auto it = std::ranges::find_if(m_mnt_pairs, [&](const auto& mount) {
+        // Prefer nested mounts such as writable /app0/logs
+        const MntPair* best = nullptr;
+        for (const auto& mount : m_mnt_pairs) {
             // When doing starts-with check, add a trailing slash to make sure we don't match
             // against only part of the mount path.
-            return guest_path == mount.mount || guest_path.starts_with(mount.mount + "/");
-        });
-        if (it == m_mnt_pairs.end()) {
-            return nullptr;
+            if ((guest_path == mount.mount || guest_path.starts_with(mount.mount + "/")) &&
+                (!best || mount.mount.size() > best->mount.size())) {
+                best = &mount;
+            }
         }
-        return &*it;
+        return best;
     }
 
 private:

@@ -10,7 +10,7 @@ SignalDispatch::SignalDispatch() = default;
 SignalDispatch::~SignalDispatch() = default;
 
 void SignalDispatch::RemoveHandlers() {
-    // No OS handlers are installed in tests, so there is nothing to remove.
+    // No OS handlers are installed in tests, so there is nothing to remove
 }
 
 bool SignalDispatch::DispatchAccessViolation(void* /*context*/, void* /*fault_address*/) const {

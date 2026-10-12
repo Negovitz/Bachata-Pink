@@ -3,7 +3,10 @@
 
 #pragma once
 
+#include <atomic>
 #include <condition_variable>
+#include <cstdlib>
+#include <memory>
 #include <mutex>
 #include <thread>
 #include <unordered_set>
@@ -12,9 +15,10 @@
 #include <tsl/robin_map.h>
 
 #include "common/lru_cache.h"
+#include "common/multi_level_page_table.h"
+#include "common/perf_stats.h"
 #include "common/slot_vector.h"
 #include "shader_recompiler/resource.h"
-#include "video_core/multi_level_page_table.h"
 #include "video_core/texture_cache/blit_helper.h"
 #include "video_core/texture_cache/image.h"
 #include "video_core/texture_cache/image_view.h"
@@ -49,7 +53,7 @@ class TextureCache {
         static constexpr size_t PAGE_BITS = 20;
         static constexpr bool NULL_CHECK = true;
     };
-    using PageTable = MultiLevelPageTable<Traits>;
+    using PageTable = Common::MultiLevelPageTable<Traits>;
 
 public:
     enum class BindingType : u32 {
@@ -119,12 +123,18 @@ public:
 
     /// Updates image contents if it was modified by CPU.
     void UpdateImage(ImageId image_id) {
-        std::scoped_lock lock{mutex};
+        std::scoped_lock lk{mutex};
         Image& image = slot_images[image_id];
         TrackImage(image_id);
         TouchImage(image);
         RefreshImage(image);
     }
+
+    /// Update a render or depth target on the command processor thread
+    /// Skip the lock only if the image is clean, tracked and
+    /// already touched this GC tick
+    /// Guest writes and image unmaps must not have changed its pages
+    void UpdateTarget(ImageId image_id);
 
     /// Resolves overlap between existing cache image and pending merged image
     [[nodiscard]] std::tuple<ImageId, int, int> ResolveOverlap(const ImageInfo& info,
@@ -268,7 +278,69 @@ public:
         }
     }
 
+    /// Diagnostic (SHADPS4_HARNESS_PROGRESS): registered images and the largest one registered
+    [[nodiscard]] std::pair<u64, u64> GetImageStats() const noexcept {
+        return {stat_images.load(std::memory_order_relaxed),
+                stat_largest_image.load(std::memory_order_relaxed)};
+    }
+
+    /// Count image registrations and removals so a reused T# can tell when FindImage might choose a
+    /// different registered image
+    [[nodiscard]] u64 ImageSetGeneration() const noexcept {
+        return image_set_generation.load(std::memory_order_acquire);
+    }
+
+    /// Start recording image generations on each affected page whenever an image is registered or
+    /// removed for tsharp_cache and keep those stamps available for later cached lookup checks
+    void EnablePageStamps();
+
+    /// Check whether any image was registered or removed on the pages covering [addr, addr + size)
+    /// after generation
+    /// FindImage only searches those pages, so its earlier result still holds if none changed
+    /// Return false when page stamps are unavailable and a cached lookup cannot be checked this way
+    [[nodiscard]] bool PagesUnchangedSince(VAddr addr, u64 size, u64 generation) const noexcept {
+        if (!page_stamps || size == 0) {
+            return false;
+        }
+        const u64 page_end = (addr + size - 1) >> Traits::PAGE_BITS;
+        if (page_end >= NumStampPages) {
+            return false;
+        }
+        for (u64 page = addr >> Traits::PAGE_BITS; page <= page_end; ++page) {
+            if (page_stamps[page].load(std::memory_order_acquire) > generation) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /// Do the extra image work FindImage normally performs when incremental_bind or tsharp_cache
+    /// reuses a lookup result
+    /// Touch the LRU under its lock, at most once per GC tick, so cached bindings still keep an
+    /// image recently used
+    void TouchReusedImage(ImageId image_id);
+
 private:
+    static constexpr u64 NumStampPages = 1ULL << (Traits::ADDRESS_SPACE_BITS - Traits::PAGE_BITS);
+    void StampPages(VAddr addr, u64 size, u64 generation);
+
+    std::atomic<u64> image_set_generation{0};
+    std::unique_ptr<std::atomic<u64>[]> page_stamps;
+
+    /// Stamp affected 1 MiB pages before guest writes or unmaps change any image
+    void StampWrite(VAddr addr, u64 size);
+    [[nodiscard]] bool PagesWrittenSince(VAddr addr, u64 size, u64 generation) const noexcept;
+    std::atomic<u64> write_generation{1};
+    std::unique_ptr<std::atomic<u64>[]> write_stamps{
+        std::make_unique<std::atomic<u64>[]>(NumStampPages)};
+    /// SHADPS4_TARGET_FAST_VERIFY: each skip is checked under the lock, then
+    /// the full update runs anyway
+    const bool target_fast_verify{std::getenv("SHADPS4_TARGET_FAST_VERIFY") != nullptr};
+    /// In-run A/B of the skip: SHADPS4_AB_TOGGLE with "target_fast_update" in
+    /// SHADPS4_AB_TOGGLE_KEYS (no setting)
+    const bool target_fast_toggle{Common::PerfStats::AbToggleFollows("target_fast_update")};
+    std::atomic<u64> stat_images{0};
+    std::atomic<u64> stat_largest_image{0};
     /// Iterate over all page indices in a range
     template <typename Func>
     static void ForEachPage(PAddr addr, size_t size, Func&& func) {
@@ -316,7 +388,7 @@ private:
     void DeleteImage(ImageId image_id);
 
     /// Touch the image in the LRU cache.
-    void TouchImage(const Image& image);
+    void TouchImage(Image& image);
 
     void FreeImage(ImageId image_id) {
         UntrackImage(image_id);
@@ -352,6 +424,7 @@ private:
     Common::LeastRecentlyUsedCache<ImageId, u64> lru_cache;
     Common::LeastRecentlyUsedCache<u64, u64> sampler_lru_cache;
     const bool readback_linear_images;
+    const bool gc_full_scan; ///< texture_gc_full_scan
     PageTable page_table;
     std::mutex mutex;
     std::mutex samplers_mutex;

@@ -3,10 +3,16 @@
 
 #pragma once
 
+#include <array>
+#include <chrono>
+
 #include "common/recursive_lock.h"
 #include "common/shared_first_mutex.h"
 #include "video_core/buffer_cache/buffer_cache.h"
+#include "video_core/mapped_page_table.h"
 #include "video_core/page_manager.h"
+#include "video_core/renderer_vulkan/vk_bind_cache.h"
+#include "video_core/renderer_vulkan/vk_gpu_checkpoints.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/texture_cache/texture_cache.h"
@@ -53,6 +59,15 @@ public:
     void DispatchDirect();
     void DispatchIndirect(VAddr address, u32 offset, u32 size);
 
+    /// gcn_unordered_dispatches: ring of the packets processed next (0 = graphics,
+    /// 1 + vqid = compute queue)
+    void SetCommandRing(u8 ring) noexcept {
+        command_ring = ring < MaxCommandRings ? ring : MaxCommandRings - 1;
+    }
+    /// gcn_unordered_dispatches: the game sent a sync packet (event write,
+    /// EOP/EOS/RELEASE_MEM, ACQUIRE_MEM, a wait) on the current ring
+    void OnGameSync();
+
     void ScopeMarker(fmt::string_view fmt, fmt::format_args args, auto&& func) {
         if (host_markers_enabled) {
             ScopeMarkerBegin(fmt::vformat(fmt, args));
@@ -72,9 +87,27 @@ public:
     void FillBuffer(VAddr address, u32 num_bytes, u32 value, bool is_gds);
     void CopyBuffer(VAddr dst, VAddr src, u32 num_bytes, bool dst_gds, bool src_gds);
     u32 ReadDataFromGds(u32 gsd_offset);
+    /// Per-game lod_stats_from_bindings: answers IT_GET_LOD_STATS from the counter banks of the T#s bound
+    /// since the previous packet. Returns false when the workaround is off
+    bool WriteLodStats(VAddr address, u32 num_bytes);
     bool InvalidateMemory(VAddr addr, u64 size, bool assume_locks = false);
     bool ReadMemory(VAddr addr, u64 size, bool assume_locks = false);
+    void ReleaseCpuAuthoritativeRange(VAddr addr, u64 size);
     bool IsMapped(VAddr addr, u64 size);
+    /// Clean reads (srt_walker_clean_reads, shader_code_clean_reads): copies GPU-mapped bytes the GPU never
+    /// wrote from the physical backing without touching their page, which may be protected because it shares
+    /// a GPU-written buffer. A readback would leave the same value there. Returns false for GPU-written or
+    /// unbacked bytes. Command processor thread only
+    bool ReadCleanMemory(VAddr addr, void* out, u64 size);
+
+    /// Returns false for a T# that describes an image Vulkan cannot create (garbage descriptor)
+    bool IsPlausibleImage(const VideoCore::ImageInfo& info, bool log = true);
+    /// Check whether the texture can be bound, or should use a null descriptor
+    /// Share the checks with descriptor arrays and return the built bound_desc
+    /// Enable log to report a rejection
+    bool CheckBindableImage(const AmdGpu::Image& tsharp, const Shader::ImageResource& image_desc,
+                            std::optional<VideoCore::TextureCache::ImageDesc>& bound_desc,
+                            bool log);
     void MapMemory(VAddr addr, u64 size);
     void RegisterMemory(VAddr addr, u64 size);
     void UnmapMemory(VAddr addr, u64 size);
@@ -103,8 +136,18 @@ public:
 #endif
 
 private:
+    bool IsMappedCached(VAddr addr, VAddr end);
+    /// With SHADPS4_MAPPED_PAGE_TABLE_VERIFY, compare each table answer with the interval set and
+    /// report how often the table returns Unknown once a minute
+    void VerifyMappedPageTable(VAddr addr, u64 size, VideoCore::MappedPageTable::Answer answer);
+    /// Mirror the mapping change for [addr, addr + size) in the page table while
+    /// mapped_ranges_mutex is still held
+    void UpdateMappedPageTable(VAddr addr, u64 size, bool mapped);
     void PrepareRenderState(const GraphicsPipeline* pipeline);
     RenderState BeginRendering(const GraphicsPipeline* pipeline);
+    /// Layout BeginRendering gives the current draw's depth target, none without one
+    std::optional<vk::ImageLayout> DepthTargetLayout(const VideoCore::Image& image) const;
+    static bool IsReadOnlyDepthLayout(vk::ImageLayout layout);
     void Resolve();
     void DepthStencilCopy(bool is_depth, bool is_stencil);
     void EliminateFastClear();
@@ -121,12 +164,31 @@ private:
     void BindBuffers(const Shader::Info& stage, Shader::Backend::Bindings& binding,
                      Shader::PushData& push_data);
     void BindTextures(const Shader::Info& stage, Shader::Backend::Bindings& binding);
+    /// dynamic_tsharp_array_size: logs the first descriptor array bound, then a per-minute count
+    void ReportTsharpArray(u64 pgm_hash, u32 num_elements, u32 null_elements);
+    /// SHADPS4_CLEAN_READ_VERIFY: reads back the bytes a clean read served and reports any difference
+    void VerifyCleanRead(VAddr addr, const void* served, u64 size);
     bool BindResources(const Pipeline* pipeline);
+    /// Refreshes sampled descriptors with their final subresource layouts
+    void RefreshImageDescriptorLayouts();
+
+    /// gpu_checkpoints: attaches SHADPS4_GPU_DIAG details to the command just recorded and runs the
+    /// SHADPS4_GPU_SYNC_EVERY bisection
+    void OnGpuCommandRecorded();
+    /// SHADPS4_GPU_DIAG: copies words of a buffer into host memory on the GPU, right before the command that
+    /// reads them. Returns null when no capture buffer exists
+    const u32* CaptureWords(vk::Buffer buffer, u64 offset, u32 num_words);
+    void CaptureBufferHeads();
 
     void BindVertexBuffers(const GraphicsPipeline* pipeline);
     void BindIndexBuffer(u32 index_offset = 0);
 
     void ResetBindings(bool is_compute);
+    /// Count reused V# and T# slots checked against a full binding and log any mismatch so the
+    /// cache assumptions can be verified
+    void VerifyIncrementalBind(bool matches, const char* kind, u64 pgm_hash, VAddr address);
+    /// Submits periodically without waiting
+    void FlushPeriodic();
 
     bool IsComputeMetaClear(const Pipeline* pipeline);
     bool IsComputeImageCopy(const Pipeline* pipeline);
@@ -152,9 +214,20 @@ private:
     using RenderTargetInfo = std::pair<VideoCore::ImageId, VideoCore::TextureCache::ImageDesc>;
     std::array<RenderTargetInfo, AmdGpu::NUM_COLOR_BUFFERS> cb_descs;
     std::pair<VideoCore::ImageId, VideoCore::TextureCache::ImageDesc> db_desc;
-    boost::container::static_vector<vk::DescriptorImageInfo, Shader::NUM_IMAGES> image_infos;
+    // Room for dynamic_tsharp_array_size descriptor arrays (array_size + 1 bindings each; the recompiler
+    // keeps a shader's arrays within NUM_IMAGE_ARRAY_DESCRIPTORS)
+    static constexpr u32 MaxImageDescriptors =
+        Shader::NUM_IMAGES + Shader::NUM_IMAGE_ARRAY_DESCRIPTORS;
+    boost::container::static_vector<vk::DescriptorImageInfo, MaxImageDescriptors> image_infos;
+    // Sampled descriptors that need a final layout refresh
+    struct ImageDescriptorRef {
+        u32 info_index;
+        const VideoCore::Image::BackingImage* backing;
+        u32 subres_idx;
+    };
+    boost::container::static_vector<ImageDescriptorRef, MaxImageDescriptors> image_descriptor_refs;
     boost::container::static_vector<vk::DescriptorBufferInfo, Shader::NUM_BUFFERS> buffer_infos;
-    boost::container::static_vector<VideoCore::ImageId, Shader::NUM_IMAGES> bound_images;
+    boost::container::static_vector<VideoCore::ImageId, MaxImageDescriptors> bound_images;
     struct BoundBuffer {
         const VideoCore::Buffer* buffer;
         u64 offset;
@@ -168,9 +241,90 @@ private:
     Shader::PushData push_data;
 
     using ImageBindingInfo = std::pair<VideoCore::ImageId, VideoCore::TextureCache::ImageDesc>;
-    boost::container::static_vector<ImageBindingInfo, Shader::NUM_IMAGES> image_bindings;
+    boost::container::static_vector<ImageBindingInfo, MaxImageDescriptors> image_bindings;
     bool attachment_feedback_loop{};
     bool needs_barrier{};
+    // gpu_checkpoints diagnostics (SHADPS4_GPU_DIAG, SHADPS4_GPU_SYNC_EVERY)
+    GpuCheckpoints::Detail diag_detail{};
+    std::array<vk::DescriptorBufferInfo, GpuCheckpoints::Detail::MaxBuffers> diag_sources{};
+    static constexpr u64 DiagCaptureBufferSize = 8_MB;
+    std::unique_ptr<VideoCore::Buffer> diag_capture_buffer;
+    u64 diag_capture_offset{};
+    u32 diag_commands_since_sync{};
+    std::chrono::steady_clock::time_point diag_start{std::chrono::steady_clock::now()};
+    // lod_stats_from_bindings: bindings per T# counter_bank_id since the last IT_GET_LOD_STATS. Only the GPU
+    // command processor thread binds textures and processes the packet
+    const bool lod_stats_enabled;
+    const u32 periodic_flush_commands;
+    // cp_recording_cuts: IsMapped answers from a per-thread cache of mapped runs
+    const bool recording_cuts;
+    const bool recording_cuts_toggle; ///< cp_recording_cuts follows SHADPS4_AB_TOGGLE
+    // Keep a table of 16 KB mapped pages beside mapped_ranges for checks without the shared lock,
+    // or leave it null when the setting is off
+    std::unique_ptr<VideoCore::MappedPageTable> mapped_page_table;
+    const bool mapped_page_table_toggle; ///< Whether mapped_page_table is active for this interval of SHADPS4_AB_TOGGLE
+    const bool mapped_page_table_verify;
+    // Keep the cache for the pipeline being bound, its starting generations and the next V# and T#
+    // slots to visit
+    // The cache pointer is null when incremental_bind is disabled so the call follows the regular
+    // binding path
+    const bool incremental_bind;
+    const bool incremental_bind_toggle; ///< Whether incremental_bind is active for this interval of SHADPS4_AB_TOGGLE
+    /// With SHADPS4_INCREMENTAL_BIND_VERIFY, bind reusable slots through the full path as well and
+    /// compare the two results
+    const bool incremental_bind_verify;
+    BindCache* bind_cache{};
+    BindCache::Generations bind_generations{};
+    u32 bind_cache_buffer_index{};
+    u32 bind_cache_image_index{};
+    // Share T# resolutions across pipelines and remember whether that cache is enabled for the
+    // current binding call
+    // The pointer stays null when tsharp_cache is disabled and the regular resolution path remains
+    // available
+    std::unique_ptr<TsharpCache> tsharp_cache;
+    const bool tsharp_cache_toggle; ///< Whether tsharp_cache is active for this interval of SHADPS4_AB_TOGGLE
+    /// With SHADPS4_TSHARP_CACHE_VERIFY, resolve cached T# entries through the full lookup again
+    /// and compare the images and views
+    const bool tsharp_cache_verify;
+    bool tsharp_cache_on{};
+    // depth_target_sampled_layout, whether it follows SHADPS4_AB_TOGGLE and whether it
+    // is on for the draw being recorded
+    const bool depth_target_sampled_layout;
+    const bool depth_target_sampled_toggle;
+    bool depth_target_shared{};
+    static constexpr vk::AccessFlags2 SharedDepthTargetAccess =
+        vk::AccessFlagBits2::eDepthStencilAttachmentWrite |
+        vk::AccessFlagBits2::eDepthStencilAttachmentRead;
+
+    /// gcn_unordered_dispatches: notes a guest draw or dispatch on the current ring
+    /// For a dispatch whose previous command on the ring was a dispatch, with
+    /// no sync packet since, returns the ring (GCN may start it before the
+    /// previous one ends), else -1
+    s8 NoteRingCommand(bool is_dispatch);
+    static constexpr u8 MaxCommandRings = 16;
+    const bool gcn_unordered_dispatches;
+    const bool gcn_unordered_toggle; ///< gcn_unordered_dispatches follows SHADPS4_AB_TOGGLE
+    u8 command_ring{};
+    std::array<bool, MaxCommandRings> ring_last_dispatch{};
+    std::array<bool, MaxCommandRings> ring_synced{};
+    // Of the dispatch being recorded: its NoteRingCommand, and whether its buffer
+    // accesses are those of a game dispatch without DMA (DMA reaches memory the
+    // barrier tracking does not see)
+    s8 unordered_ring{-1};
+    bool game_dispatch_accesses{};
+    const u64 unbounded_cap_bytes; ///< unbounded_vsharp_cap_mb in bytes, 0 = off
+    u64 bind_verify_checks{};
+    u64 bind_verify_mismatches{};
+    u64 bind_verify_raced{};
+    std::chrono::steady_clock::time_point bind_verify_last_report{};
+    std::array<u32, 256> lod_stats_uses{};
+    u64 lod_stats_packets_minute{};
+    u64 lod_stats_banks_minute{};
+    std::chrono::steady_clock::time_point lod_stats_last_report{};
+    // dynamic_tsharp_array_size: descriptor arrays bound and their null elements
+    u64 tsharp_array_binds_minute{};
+    u64 tsharp_array_null_minute{};
+    std::chrono::steady_clock::time_point tsharp_array_last_report{};
 };
 
 } // namespace Vulkan

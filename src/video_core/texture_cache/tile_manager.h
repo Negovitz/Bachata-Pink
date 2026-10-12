@@ -63,6 +63,8 @@ private:
     vk::UniqueDescriptorSetLayout desc_layout;
     vk::UniquePipelineLayout pl_layout;
     std::unordered_map<TilingKey, vk::UniquePipeline, TilingKey::Hash> tiling_pipelines;
+    bool gpu_overhead_cuts{};
+    bool gpu_overhead_cuts_toggle{};
 };
 
 } // namespace VideoCore

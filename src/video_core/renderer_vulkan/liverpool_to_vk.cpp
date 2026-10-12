@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include "common/assert.h"
+#include "common/logging/events.h"
 #include "common/number_utils.h"
 #include "video_core/amdgpu/pixel_format.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
@@ -9,7 +10,8 @@
 #include <magic_enum/magic_enum.hpp>
 
 #define INVALID_NUMBER_FORMAT_COMBO                                                                \
-    LOG_ERROR(Render_Vulkan, "Unsupported number type {} for format {}", number_type, format);
+    LOG_RENDER_PROBLEM(Render_Vulkan, Error, "Unsupported number type {} for format {}",           \
+                       number_type, format);
 
 namespace Vulkan::LiverpoolToVK {
 
@@ -36,8 +38,8 @@ vk::StencilOp StencilOp(AmdGpu::StencilFunc op) {
     case AmdGpu::StencilFunc::ReplaceOp:
         return vk::StencilOp::eReplace;
     case AmdGpu::StencilFunc::Ones:
-        LOG_WARNING(Render_Vulkan, "Unsupported stencil op {}, using Replace.",
-                    static_cast<u32>(op));
+        LOG_RENDER_PROBLEM(Render_Vulkan, Warning, "Unsupported stencil op {}, using Replace.",
+                           static_cast<u32>(op));
         return vk::StencilOp::eReplace;
     case AmdGpu::StencilFunc::And:
     case AmdGpu::StencilFunc::Or:
@@ -46,11 +48,11 @@ vk::StencilOp StencilOp(AmdGpu::StencilFunc op) {
     case AmdGpu::StencilFunc::Nor:
     case AmdGpu::StencilFunc::Xnor:
         // Bitwise stencil operations have no Vulkan equivalent; eKeep is the safest fallback.
-        LOG_WARNING(Render_Vulkan, "Unsupported bitwise stencil op {}, using Keep.",
-                    static_cast<u32>(op));
+        LOG_RENDER_PROBLEM(Render_Vulkan, Warning, "Unsupported bitwise stencil op {}, using Keep.",
+                           static_cast<u32>(op));
         return vk::StencilOp::eKeep;
     default:
-        UNREACHABLE();
+        AmdGpu::WarnInvalidDescriptorOnce("StencilOp", u32(op), "vk::StencilOp::eKeep");
         return vk::StencilOp::eKeep;
     }
 }
@@ -74,7 +76,7 @@ vk::CompareOp CompareOp(AmdGpu::CompareFunc func) {
     case AmdGpu::CompareFunc::Never:
         return vk::CompareOp::eNever;
     default:
-        UNREACHABLE();
+        AmdGpu::WarnInvalidDescriptorOnce("CompareOp", u32(func), "vk::CompareOp::eAlways");
         return vk::CompareOp::eAlways;
     }
 }
@@ -101,7 +103,7 @@ bool IsPrimitiveCulled(AmdGpu::PrimitiveType type) {
     case AmdGpu::PrimitiveType::LineLoop:
         return false;
     default:
-        UNREACHABLE();
+        AmdGpu::WarnInvalidDescriptorOnce("IsPrimitiveCulled", u32(type), "true");
         return true;
     }
 }
@@ -122,7 +124,8 @@ vk::PrimitiveTopology PrimitiveType(AmdGpu::PrimitiveType type) {
     case AmdGpu::PrimitiveType::TriangleStrip:
         return vk::PrimitiveTopology::eTriangleStrip;
     case AmdGpu::PrimitiveType::QuadStrip:
-        LOG_WARNING(Render_Vulkan, "Unimplemented primitive type, using TriangleStrip.");
+        LOG_RENDER_PROBLEM(Render_Vulkan, Warning,
+                           "Unimplemented primitive type, using TriangleStrip.");
         return vk::PrimitiveTopology::eTriangleStrip;
     case AmdGpu::PrimitiveType::AdjLineList:
         return vk::PrimitiveTopology::eLineListWithAdjacency;
@@ -138,7 +141,7 @@ vk::PrimitiveTopology PrimitiveType(AmdGpu::PrimitiveType type) {
     case AmdGpu::PrimitiveType::RectList:
         return vk::PrimitiveTopology::ePatchList;
     default:
-        UNREACHABLE_MSG("Unimplemented primitive type: {}", static_cast<u32>(type));
+        AmdGpu::WarnInvalidDescriptorOnce("PrimitiveType", u32(type), "vk::PrimitiveTopology::eTriangleList");
         return vk::PrimitiveTopology::eTriangleList;
     }
 }
@@ -152,7 +155,7 @@ vk::PolygonMode PolygonMode(AmdGpu::PolygonMode mode) {
     case AmdGpu::PolygonMode::Fill:
         return vk::PolygonMode::eFill;
     default:
-        UNREACHABLE();
+        AmdGpu::WarnInvalidDescriptorOnce("PolygonMode", u32(mode), "vk::PolygonMode::eFill");
         return vk::PolygonMode::eFill;
     }
 }
@@ -168,7 +171,7 @@ vk::CullModeFlags CullMode(AmdGpu::CullMode mode) {
     case AmdGpu::CullMode::FrontAndBack:
         return vk::CullModeFlagBits::eFrontAndBack;
     default:
-        UNREACHABLE();
+        AmdGpu::WarnInvalidDescriptorOnce("CullMode", u32(mode), "vk::CullModeFlagBits::eNone");
         return vk::CullModeFlagBits::eNone;
     }
 }
@@ -180,7 +183,7 @@ vk::FrontFace FrontFace(AmdGpu::FrontFace face) {
     case AmdGpu::FrontFace::CounterClockwise:
         return vk::FrontFace::eCounterClockwise;
     default:
-        UNREACHABLE();
+        AmdGpu::WarnInvalidDescriptorOnce("FrontFace", u32(face), "vk::FrontFace::eClockwise");
         return vk::FrontFace::eClockwise;
     }
 }
@@ -227,7 +230,8 @@ vk::BlendFactor BlendFactor(AmdGpu::BlendControl::BlendFactor factor) {
     case BlendFactor::OneMinusConstantAlpha:
         return vk::BlendFactor::eOneMinusConstantAlpha;
     default:
-        UNREACHABLE_MSG("Unknown blend factor: {}", static_cast<u32>(factor));
+        AmdGpu::WarnInvalidDescriptorOnce("BlendFactor", u32(factor), "vk::BlendFactor::eZero");
+        return vk::BlendFactor::eZero;
     }
 }
 
@@ -258,7 +262,8 @@ vk::BlendOp BlendOp(AmdGpu::BlendControl::BlendFunc func) {
     case BlendFunc::ReverseSubtract:
         return vk::BlendOp::eReverseSubtract;
     default:
-        UNREACHABLE_MSG("Unknown blend op: {}", static_cast<u32>(func));
+        AmdGpu::WarnInvalidDescriptorOnce("BlendOp", u32(func), "vk::BlendOp::eAdd");
+        return vk::BlendOp::eAdd;
     }
 }
 
@@ -278,8 +283,8 @@ vk::LogicOp LogicOp(AmdGpu::ColorControl::LogicOp logic_op) {
     case LogicOp::Invert:
         return vk::LogicOp::eInvert;
     case LogicOp::BrushXor:
-        LOG_WARNING(Render_Vulkan, "Unimplemented logic op {:#x}, using closest equivalent",
-                    u32(logic_op));
+        LOG_RENDER_PROBLEM(Render_Vulkan, Warning,
+                           "Unimplemented logic op {:#x}, using closest equivalent", u32(logic_op));
         [[fallthrough]];
     case LogicOp::Xor:
         return vk::LogicOp::eXor;
@@ -302,7 +307,8 @@ vk::LogicOp LogicOp(AmdGpu::ColorControl::LogicOp logic_op) {
     case LogicOp::Set:
         return vk::LogicOp::eSet;
     default:
-        UNREACHABLE_MSG("Unknown logic op {}", u32(logic_op));
+        AmdGpu::WarnInvalidDescriptorOnce("LogicOp", u32(logic_op), "vk::LogicOp::eCopy");
+        return vk::LogicOp::eCopy;
     }
 }
 
@@ -317,19 +323,22 @@ vk::SamplerAddressMode ClampMode(AmdGpu::ClampMode mode) {
         return vk::SamplerAddressMode::eClampToEdge;
     case AmdGpu::ClampMode::MirrorOnceHalfBorder:
     case AmdGpu::ClampMode::MirrorOnceBorder:
-        LOG_WARNING(Render_Vulkan, "Unimplemented clamp mode {}, using closest equivalent.",
-                    static_cast<u32>(mode));
+        LOG_RENDER_PROBLEM(Render_Vulkan, Warning,
+                           "Unimplemented clamp mode {}, using closest equivalent.",
+                           static_cast<u32>(mode));
         [[fallthrough]];
     case AmdGpu::ClampMode::MirrorOnceLastTexel:
         return vk::SamplerAddressMode::eMirrorClampToEdge;
     case AmdGpu::ClampMode::ClampHalfBorder:
-        LOG_WARNING(Render_Vulkan, "Unimplemented clamp mode {}, using closest equivalent.",
-                    static_cast<u32>(mode));
+        LOG_RENDER_PROBLEM(Render_Vulkan, Warning,
+                           "Unimplemented clamp mode {}, using closest equivalent.",
+                           static_cast<u32>(mode));
         [[fallthrough]];
     case AmdGpu::ClampMode::ClampBorder:
         return vk::SamplerAddressMode::eClampToBorder;
     default:
-        UNREACHABLE();
+        AmdGpu::WarnInvalidDescriptorOnce("ClampMode", u32(mode), "vk::SamplerAddressMode::eClampToEdge");
+        return vk::SamplerAddressMode::eClampToEdge;
     }
 }
 
@@ -352,7 +361,8 @@ vk::CompareOp DepthCompare(AmdGpu::DepthCompare comp) {
     case AmdGpu::DepthCompare::Always:
         return vk::CompareOp::eAlways;
     default:
-        UNREACHABLE();
+        AmdGpu::WarnInvalidDescriptorOnce("DepthCompare", u32(comp), "vk::CompareOp::eAlways");
+        return vk::CompareOp::eAlways;
     }
 }
 
@@ -365,7 +375,8 @@ vk::Filter Filter(AmdGpu::Filter filter) {
     case AmdGpu::Filter::AnisoLinear:
         return vk::Filter::eLinear;
     default:
-        UNREACHABLE();
+        AmdGpu::WarnInvalidDescriptorOnce("Filter", u32(filter), "vk::Filter::eNearest");
+        return vk::Filter::eNearest;
     }
 }
 
@@ -378,7 +389,8 @@ vk::SamplerReductionMode FilterMode(AmdGpu::FilterMode mode) {
     case AmdGpu::FilterMode::Max:
         return vk::SamplerReductionMode::eMax;
     default:
-        UNREACHABLE();
+        AmdGpu::WarnInvalidDescriptorOnce("FilterMode", u32(mode), "vk::SamplerReductionMode::eWeightedAverage");
+        return vk::SamplerReductionMode::eWeightedAverage;
     }
 }
 
@@ -391,7 +403,8 @@ vk::SamplerMipmapMode MipFilter(AmdGpu::MipFilter filter) {
     case AmdGpu::MipFilter::None:
         return vk::SamplerMipmapMode::eNearest;
     default:
-        UNREACHABLE();
+        AmdGpu::WarnInvalidDescriptorOnce("MipFilter", u32(filter), "vk::SamplerMipmapMode::eNearest");
+        return vk::SamplerMipmapMode::eNearest;
     }
 }
 
@@ -406,12 +419,13 @@ vk::BorderColor BorderColor(AmdGpu::BorderColor color) {
     case AmdGpu::BorderColor::Custom:
         return vk::BorderColor::eFloatCustomEXT;
     default:
-        UNREACHABLE();
+        AmdGpu::WarnInvalidDescriptorOnce("BorderColor", u32(color), "vk::BorderColor::eFloatTransparentBlack");
+        return vk::BorderColor::eFloatTransparentBlack;
     }
 }
 
 vk::ComponentSwizzle ComponentSwizzle(AmdGpu::CompSwizzle comp_swizzle) {
-    switch (comp_swizzle) {
+    switch (AmdGpu::NormalizeCompSwizzle(comp_swizzle)) {
     case AmdGpu::CompSwizzle::Zero:
         return vk::ComponentSwizzle::eZero;
     case AmdGpu::CompSwizzle::One:
@@ -425,7 +439,8 @@ vk::ComponentSwizzle ComponentSwizzle(AmdGpu::CompSwizzle comp_swizzle) {
     case AmdGpu::CompSwizzle::Alpha:
         return vk::ComponentSwizzle::eA;
     default:
-        UNREACHABLE();
+        AmdGpu::WarnInvalidDescriptorOnce("ComponentSwizzle", u32(comp_swizzle), "vk::ComponentSwizzle::eZero");
+        return vk::ComponentSwizzle::eZero;
     }
 }
 
@@ -789,6 +804,14 @@ vk::Format SurfaceFormat(AmdGpu::DataFormat data_format, AmdGpu::NumberFormat nu
     return result;
 }
 
+vk::Format TrySurfaceFormat(AmdGpu::DataFormat data_format, AmdGpu::NumberFormat num_format) {
+    if (u32(data_format) >= 1 << amd_gpu_data_format_bit_size ||
+        u32(num_format) >= 1 << amd_gpu_number_format_bit_size) {
+        return vk::Format::eUndefined;
+    }
+    return surface_format_table[GetSurfaceFormatTableIndex(data_format, num_format)];
+}
+
 static constexpr DepthFormatInfo CreateDepthFormatInfo(
     const DepthBuffer::ZFormat z_format, const DepthBuffer::StencilFormat stencil_format,
     const vk::Format vk_format) {
@@ -820,6 +843,13 @@ std::span<const DepthFormatInfo> DepthFormats() {
 }
 
 vk::Format DepthFormat(DepthBuffer::ZFormat z_format, DepthBuffer::StencilFormat stencil_format) {
+    if (z_format != DepthBuffer::ZFormat::Invalid && z_format != DepthBuffer::ZFormat::Z16 &&
+        z_format != DepthBuffer::ZFormat::Z32Float) {
+        // Value 2 is reserved on GCN (Z_24 on older parts). DepthBuffer::NumBits() sizes such a buffer as 16
+        // bits, so it is created as 16-bit depth too
+        AmdGpu::WarnInvalidDescriptorOnce("DepthFormat", static_cast<u32>(z_format), "Z16");
+        z_format = DepthBuffer::ZFormat::Z16;
+    }
     const auto& formats = DepthFormats();
     const auto format =
         std::find_if(formats.begin(), formats.end(), [&](const DepthFormatInfo& format_info) {
@@ -1153,7 +1183,7 @@ vk::ClearValue ColorBufferClearValue(const AmdGpu::ColorBuffer& color_buffer) {
         color.float32[3] = NumberUtils::U4ToUnorm(c0 >> 12);
         break;
     default:
-        LOG_ERROR(Render_Vulkan, "Unsupported color buffer format: {}", format);
+        LOG_RENDER_PROBLEM(Render_Vulkan, Error, "Unsupported color buffer format: {}", format);
         break;
     }
 
@@ -1174,7 +1204,8 @@ vk::SampleCountFlagBits RawNumSamples(u32 num_samples) {
     case 16:
         return vk::SampleCountFlagBits::e16;
     default:
-        UNREACHABLE();
+        AmdGpu::WarnInvalidDescriptorOnce("RawNumSamples", u32(num_samples), "vk::SampleCountFlagBits::e1");
+        return vk::SampleCountFlagBits::e1;
     }
 }
 

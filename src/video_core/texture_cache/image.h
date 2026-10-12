@@ -7,6 +7,7 @@
 #include "common/incremental_id.h"
 #include "common/types.h"
 #include "video_core/renderer_vulkan/vk_common.h"
+#include "video_core/texture_cache/image_barriers.h"
 #include "video_core/texture_cache/image_info.h"
 #include "video_core/texture_cache/image_view.h"
 
@@ -47,21 +48,33 @@ struct UniqueImage {
     UniqueImage& operator=(const UniqueImage&) = delete;
 
     UniqueImage(UniqueImage&& other)
-        : allocator{std::exchange(other.allocator, VK_NULL_HANDLE)},
+        : device{other.device}, allocator{std::exchange(other.allocator, VK_NULL_HANDLE)},
           allocation{std::exchange(other.allocation, VK_NULL_HANDLE)},
-          image{std::exchange(other.image, VK_NULL_HANDLE)}, image_ci{std::move(other.image_ci)} {}
+          image{std::exchange(other.image, VK_NULL_HANDLE)}, image_ci{std::move(other.image_ci)},
+          size_bytes{other.size_bytes} {}
     UniqueImage& operator=(UniqueImage&& other) {
+        device = other.device;
         image = std::exchange(other.image, VK_NULL_HANDLE);
         allocator = std::exchange(other.allocator, VK_NULL_HANDLE);
         allocation = std::exchange(other.allocation, VK_NULL_HANDLE);
         image_ci = std::move(other.image_ci);
+        size_bytes = other.size_bytes;
         return *this;
     }
 
-    void Create(const vk::ImageCreateInfo& image_ci);
+    /// `texture`: made for a sampled T# (image_pool_texture_max_kb can
+    /// keep it out of the pool)
+    void Create(const vk::ImageCreateInfo& image_ci, bool texture = false);
 
     void Destroy();
 
+private:
+    /// Create the image using memory from the pool when image_memory_pool is enabled and the image
+    /// is supported
+    /// Return false so the caller can use the normal allocation path otherwise
+    bool TryCreatePooled(const vk::ImageCreateInfo& image_ci, bool texture);
+
+public:
     operator vk::Image() const {
         return image;
     }
@@ -80,8 +93,10 @@ public:
 };
 
 struct Image {
+    /// `texture`: made for a sampled T# (image_pool_texture_max_kb)
     explicit Image(const Vulkan::Instance& instance, Vulkan::Runtime& runtime,
-                   Common::SlotVector<ImageView>& slot_image_views, const ImageInfo& info);
+                   Common::SlotVector<ImageView>& slot_image_views, const ImageInfo& info,
+                   bool texture = false);
     ~Image();
 
     Image(const Image&) = delete;
@@ -125,7 +140,7 @@ struct Image {
 
     ImageView& FindView(const ImageViewInfo& view_info, bool ensure_guest_samples = true);
 
-    using Barriers = boost::container::small_vector<vk::ImageMemoryBarrier2, 32>;
+    using Barriers = ImageBarriers;
     void GetBarriers(Barriers& out_barriers, vk::ImageLayout dst_layout, vk::AccessFlags2 dst_mask,
                      vk::PipelineStageFlags2 dst_stage,
                      std::optional<SubresourceRange> subres_range = {});
@@ -139,16 +154,19 @@ public:
     ImageFlagBits flags = ImageFlagBits::Dirty;
     VAddr track_addr = 0;
     VAddr track_addr_end = 0;
+    /// Remember the last GC tick that touched this image so repeated cached bindings
+    /// update its LRU position only once per tick
+    u64 lru_touch_tick{~0ULL};
+    /// Write generation at the last TextureCache::UpdateTarget that left
+    /// the image clean, 0 for none
+    /// Next to the other fields UpdateTarget reads, on one cache line
+    u64 target_write_gen{};
     ImageId depth_id{};
     u64 depth_uid{};
 
     vk::ImageUsageFlags usage_flags;
     vk::FormatFeatureFlags2 format_features;
-    struct State {
-        vk::PipelineStageFlags2 pl_stage = vk::PipelineStageFlagBits2::eAllCommands;
-        vk::AccessFlags2 access_mask = vk::AccessFlagBits2::eNone;
-        vk::ImageLayout layout = vk::ImageLayout::eUndefined;
-    };
+    using State = ImageState;
     struct BackingImage {
         UniqueImage image;
         State state;
@@ -156,6 +174,12 @@ public:
         boost::container::small_vector<ImageViewInfo, 4> image_view_infos;
         boost::container::small_vector<ImageViewId, 4> image_view_ids;
         u32 num_samples;
+
+        /// Current layout of one mip and layer
+        [[nodiscard]] vk::ImageLayout Layout(u32 subres_idx) const {
+            return subres_idx < subresource_states.size() ? subresource_states[subres_idx].layout
+                                                          : state.layout;
+        }
     };
     std::deque<BackingImage> backing_images;
     BackingImage* backing{};

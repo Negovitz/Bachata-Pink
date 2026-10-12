@@ -17,7 +17,9 @@
 #include "common/types.h"
 #include "core/cpu_patches.h" // Windows static guest red-zone protection
 
-#define EmulatorSettings (*EmulatorSettingsImpl::GetInstance())
+// D5: a plain pointer read; GetInstance() locks a mutex and copies a shared_ptr on every access, which cost
+// ~3 ms per SotC frame on the command processor thread alone
+#define EmulatorSettings (EmulatorSettingsImpl::Current())
 
 enum HideCursorState : int {
     Never,
@@ -215,6 +217,16 @@ struct GeneralSettings {
     Setting<std::string> shadnet_webapi_server{"http://srv.shadps4.net:31315"};
     Setting<std::string> signaling_info{};
     Setting<bool> enable_upnp{true};
+    // Redirect /app0/logs to writable per-game storage
+    Setting<bool> redirect_app0_logs{false};
+    // Process affinity mask, or 0 to leave it unchanged
+    Setting<u64> cpu_affinity_mask{0};
+    // Poll the keyboard slot and connected pads from one 125 Hz timer
+    Setting<bool> poll_connected_pads_only{false};
+    // Enable Pro mode with 3840x2160 rendering and output for Shadow of the Colossus
+    // Reserve at least 1536 MB of extra memory and patch every dynamic
+    // resolution level to 2160p
+    Setting<bool> sotc_pro_4k{false};
 
     // return a vector of override descriptors (runtime, but tiny)
     std::vector<OverrideItem> GetOverrideableFields() const {
@@ -241,7 +253,14 @@ struct GeneralSettings {
             make_override<GeneralSettings>("shadnet_webapi_server",
                                            &GeneralSettings::shadnet_webapi_server),
             make_override<GeneralSettings>("signaling_info", &GeneralSettings::signaling_info),
-            make_override<GeneralSettings>("enable_upnp", &GeneralSettings::enable_upnp)};
+            make_override<GeneralSettings>("enable_upnp", &GeneralSettings::enable_upnp),
+            make_override<GeneralSettings>("redirect_app0_logs",
+                                           &GeneralSettings::redirect_app0_logs),
+            make_override<GeneralSettings>("cpu_affinity_mask",
+                                           &GeneralSettings::cpu_affinity_mask),
+            make_override<GeneralSettings>("poll_connected_pads_only",
+                                           &GeneralSettings::poll_connected_pads_only),
+            make_override<GeneralSettings>("sotc_pro_4k", &GeneralSettings::sotc_pro_4k)};
     }
 };
 
@@ -252,7 +271,8 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(GeneralSettings, install_dirs, addon_install_
                                    trophy_notification_side, connected_to_network,
                                    discord_rpc_enabled, show_fps_counter, console_language,
                                    big_picture_scale, shadnet_server, shadnet_webapi_server,
-                                   signaling_info, enable_upnp)
+                                   signaling_info, enable_upnp, redirect_app0_logs,
+                                   cpu_affinity_mask, poll_connected_pads_only, sotc_pro_4k)
 
 // -------------------------------
 // Log settings
@@ -267,6 +287,10 @@ struct LogSettings {
     Setting<unsigned long long> size_limit{100_MB};
     Setting<bool> skip_duplicate{true};
     Setting<bool> sync{true};
+    // Default to "events" for crash, shader and render problems, Critical messages and exit summaries
+    // Keep all messages in the log file and use "all" to mirror them in the console
+    // With "all" and a synced log, each warning also writes to the launcher's pipe on its logging thread
+    Setting<std::string> console_mode{"events"};
 #ifdef _WIN32
     Setting<std::string> type{"wincolor"};
 #endif
@@ -283,6 +307,7 @@ struct LogSettings {
             make_override<LogSettings>("size_limit", &LogSettings::size_limit),
             make_override<LogSettings>("skip_duplicate", &LogSettings::skip_duplicate),
             make_override<LogSettings>("sync", &LogSettings::sync),
+            make_override<LogSettings>("console_mode", &LogSettings::console_mode),
 #ifdef _WIN32
             make_override<LogSettings>("type", &LogSettings::type),
 #endif
@@ -292,10 +317,11 @@ struct LogSettings {
 #ifdef _WIN32
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(LogSettings, append, enable, filter, flush_level,
                                    max_skip_duration, separate, size_limit, skip_duplicate, sync,
-                                   type)
+                                   console_mode, type)
 #else
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(LogSettings, append, enable, filter, flush_level,
-                                   max_skip_duration, separate, size_limit, skip_duplicate, sync)
+                                   max_skip_duration, separate, size_limit, skip_duplicate, sync,
+                                   console_mode)
 #endif
 
 // -------------------------------
@@ -372,6 +398,12 @@ struct AudioSettings {
     Setting<std::string> openal_padSpk_output_device{"Default Device"};
     Setting<u32> openal_hrtf{OpenALHrtfMode::HrtfAuto};
     Setting<u32> openal_output_mode{OpenALOutputMode::OutputAuto};
+    // Match audio speed and pitch to the measured guest frame rate
+    Setting<bool> audio_follow_game_speed{false};
+    // Lowest playback speed in percent, clamped to 5-100
+    Setting<u32> audio_min_game_speed{10};
+    // Target frame rate, or 0 to use sceVideoOutSetFlipRate
+    Setting<u32> audio_game_target_fps{0};
 
     std::vector<OverrideItem> GetOverrideableFields() const {
         return std::vector<OverrideItem>{
@@ -387,14 +419,22 @@ struct AudioSettings {
             make_override<AudioSettings>("openal_padSpk_output_device",
                                          &AudioSettings::openal_padSpk_output_device),
             make_override<AudioSettings>("openal_hrtf", &AudioSettings::openal_hrtf),
-            make_override<AudioSettings>("openal_output_mode", &AudioSettings::openal_output_mode)};
+            make_override<AudioSettings>("openal_output_mode", &AudioSettings::openal_output_mode),
+            make_override<AudioSettings>("audio_follow_game_speed",
+                                         &AudioSettings::audio_follow_game_speed),
+            make_override<AudioSettings>("audio_min_game_speed",
+                                         &AudioSettings::audio_min_game_speed),
+            make_override<AudioSettings>("audio_game_target_fps",
+                                         &AudioSettings::audio_game_target_fps)};
     }
 };
 
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(AudioSettings, audio_backend, sdl_mic_device,
                                    sdl_main_output_device, sdl_padSpk_output_device,
                                    openal_mic_device, openal_main_output_device,
-                                   openal_padSpk_output_device, openal_hrtf, openal_output_mode)
+                                   openal_padSpk_output_device, openal_hrtf, openal_output_mode,
+                                   audio_follow_game_speed, audio_min_game_speed,
+                                   audio_game_target_fps)
 
 // Windows static guest red-zone protection
 struct WindowsGuestRedZoneProtectionSettings {
@@ -434,7 +474,142 @@ struct GPUSettings {
     Setting<bool> fsr_enabled{false};
     Setting<bool> rcas_enabled{true};
     Setting<int> rcas_attenuation{250};
+    // Run DLSS Neural Rendering over the final frame without motion vectors or depth
+    // Require Windows, an NVIDIA RTX GPU and nvngx_dlssnr.dll next to shadps4.exe
+    // Leave it off by default and use hotkey_toggle_dlss_nr to switch it in game
+    Setting<bool> dlss_nr_enabled{false};
+    // Select the model style: 0 Default, 1 Natural, 2 Cinematic
+    Setting<u32> dlss_nr_style{0};
+    // Set detail strength from 0 to 2
+    Setting<double> dlss_nr_intensity{1.0};
+    // Preserve the game's HUD
+    Setting<bool> dlss_nr_ui_correction{true};
     Setting<bool> userfaultfd{false};
+    // Per-game loop limit (0 = off): stop runaway compute shaders after this many back edges
+    // Shadow of the Colossus uses 1048576 to avoid a GPU timeout
+    Setting<u32> compute_loop_cap{0};
+    // On Windows, restore guest and GPU tracking protections after splitting a mapped placeholder
+    Setting<bool> preserve_split_protection{false};
+    // Keep guest thread and fiber stacks writable and CPU-owned; a protected stack page can crash the host
+    Setting<bool> cpu_authoritative_stacks{false};
+    // SotC 01.01 BPE heap address (0 = off); protect its allocator metadata from GPU readbacks
+    Setting<u64> bpe_heap_guard_address{0};
+    // Treat constant-lane ReadLane as uniform so guarded LDS barriers stay in place
+    Setting<bool> lds_barrier_uniform_readlane{false};
+    // Add EarlyFragmentTests to storage-writing pixel shaders when the guest runs depth/stencil first
+    Setting<bool> early_fragment_tests_from_z_order{false};
+    // Report bound T# counter banks as sampled at LOD 0 so games can request finer mips
+    Setting<bool> lod_stats_from_bindings{false};
+    // Turn dynamically indexed compute T# reads into descriptor arrays of this size (0 = off, max 64)
+    Setting<u32> dynamic_tsharp_array_size{0};
+    // Treat branches on LDS-exchanged values as uniform when lowering ReadLane and Ballot
+    Setting<bool> wave64_uniform_branches{false};
+    // Use GCN reduction identities for lanes missing from small host workgroups
+    Setting<bool> wave64_missing_lane_identity{true};
+    // Add LDS barriers after divergent branches in compute groups larger than one GCN wave so
+    // narrower host subgroups see completed shared writes
+    Setting<bool> lds_barriers_large_groups{true};
+    // Start instance ID VGPRs at zero on every draw
+    // Shaders that add the start instance themselves would otherwise count it twice
+    Setting<bool> relative_instance_id{false};
+    // Match GCN NaN handling for negated compares, min/max and clamp
+    // SotC uses NaN to mark occluded fog froxels
+    Setting<bool> gcn_nan_semantics{false};
+    // Use the legacy multiply rule for MAC and MAD: zero times Inf or NaN is zero
+    Setting<bool> legacy_mad_semantics{false};
+    // Record GPU commands and submits to identify the first unfinished submit after device loss
+    // Add NVIDIA checkpoints when available; recording adds a small cost per command
+    Setting<bool> gpu_checkpoints{false};
+    // Read clean SRT data from guest memory without draining the GPU
+    Setting<bool> srt_walker_clean_reads{false};
+    // Compare clean shader code through guest backing memory
+    Setting<bool> shader_code_clean_reads{false};
+    // Submit safe readbacks ahead of the command buffer being recorded
+    Setting<bool> readback_ahead{false};
+    // Submit after this many guest commands without waiting, or keep it off with 0
+    Setting<u32> periodic_flush_commands{0};
+    // Cache mapped runs used by IsMapped while dma_sync_once_per_batch handles skipping repeated
+    // DMA range sweeps separately
+    Setting<bool> cp_recording_cuts{false};
+    // Detile host textures from VRAM and skip duplicate pipeline binds
+    Setting<bool> gpu_overhead_cuts{false};
+    // Leave registered guest stacks out of bulk DMA sweeps
+    Setting<bool> dma_sweep_skip_stacks{false};
+    // Poll before blocking GPU waits for this many microseconds, or keep it off with 0
+    Setting<u32> wait_spin_us{0};
+    // Run ahead readbacks on a transfer-only queue when one is available
+    Setting<bool> readback_ahead_transfer_queue{false};
+    // Answer IsMapped from a table of mapped 16 KB pages so common buffer checks can avoid taking
+    // the shared lock
+    Setting<bool> mapped_page_table{false};
+    // Add resident DMA ranges once per sync batch because later DMA syncs in the same batch would
+    // add the same ranges again
+    Setting<bool> dma_sync_once_per_batch{false};
+    // Reuse unchanged read-only V# and T# bindings from the previous call of this pipeline while
+    // the resources they depend on stay valid
+    Setting<bool> incremental_bind{false};
+    // Reuse the last T# resolution from any pipeline while the pages it uses still contain the same
+    // registered images
+    Setting<bool> tsharp_cache{false};
+    // Check a GPU-written tick in host memory before querying the driver in mode 1, and also allow
+    // readbacks to finish on that marker in mode 2
+    Setting<u32> wait_marker{0};
+    // Sub-allocate images up to 16 MB from pools with 32 MB blocks
+    // to avoid individual device
+    // memory allocations for small images
+    Setting<bool> image_memory_pool{false};
+    // Delay gfx EOP labels by this many microseconds as a temporary timing workaround, with 0
+    // disabling it and no GPU completion guarantee
+    Setting<u32> eop_label_delay_us{0};
+    // Move Vulkan command recording and submissions from the command processor to a separate
+    // recording thread when this setting is enabled
+    Setting<bool> cp_record_thread{false};
+    // Minimum anisotropy for linear mipmapped samplers: 0, 2, 4, 8 or 16
+    // Keep stronger guest ratios, point filtering and depth compares unchanged
+    // Cap the result at the device limit
+    Setting<u32> force_anisotropy{0};
+    // Download other recent GPU-written windows during the same drain
+    // Their next CPU read can use the data without another GPU wait
+    Setting<bool> readback_hot_regions{false};
+    // Share layout and access between a sampled read-only depth
+    // target and its attachment
+    // This avoids barriers that would end the render pass between draws
+    Setting<bool> depth_target_sampled_layout{false};
+    // Skip memory barriers for same-ring dispatches with no guest sync between them
+    // Require every tracked access to come from guest dispatches without DMA
+    Setting<bool> gcn_unordered_dispatches{false};
+    // Track buffer accesses in 256 B granules with a summary bit per 64 KiB
+    // Confirm bitmap hits against exact ranges to keep barrier decisions unchanged
+    Setting<bool> access_bitmap_tracking{false};
+    // Use one-byte locks for tracked 4 KiB pages, spinning briefly before yielding
+    // Read only at boot because changing lock tables during use is unsafe
+    Setting<bool> page_spin_locks{false};
+    // Skip repeated binding, sync and residency work when the exact answer is known
+    // Merge DMA ranges in one pass and use a per-thread stack copy
+    Setting<bool> range_fast_paths{false};
+    // Cap read-only V# descriptors with num_records 0xffffffff, in MiB
+    // Use 0 to disable the cap
+    // This avoids keeping gigabytes resident after a bind made during
+    // the initial large mapping
+    Setting<u32> unbounded_vsharp_cap_mb{0};
+    // Count only freed images against the GC budget so it reaches idle CPU textures
+    // Below memory pressure, wait 300 unused ticks instead of 16 to avoid
+    // reloading active textures
+    Setting<bool> texture_gc_full_scan{false};
+    // Device memory use (MB, as the driver reports it, sparse buffer arena
+    // included) above which the image GC starts freeing idle images; 0 = automatic
+    // (half of the budget beyond 8 GB)
+    Setting<u32> texture_gc_trigger_mb{0};
+    // Give sampled textures above this KiB threshold their own allocation
+    // Use 0 to disable the threshold and require image_memory_pool
+    // Keep render targets, storage images and smaller textures in the pool
+    Setting<u32> image_pool_texture_max_kb{0};
+    // Release idle 2 MiB arena pieces after this many seconds,
+    // with 0 disabling eviction
+    // Keep GPU-written data and allocations made by DMA faults
+    // Upload the bytes again when an evicted range is reused
+    Setting<u32> arena_evict_idle_s{0};
+    Setting<bool> inline_fetch_shader{false};
     // TODO add overrides
     std::vector<OverrideItem> GetOverrideableFields() const {
         return std::vector<OverrideItem>{
@@ -449,6 +624,11 @@ struct GPUSettings {
             make_override<GPUSettings>("fsr_enabled", &GPUSettings::fsr_enabled),
             make_override<GPUSettings>("rcas_enabled", &GPUSettings::rcas_enabled),
             make_override<GPUSettings>("rcas_attenuation", &GPUSettings::rcas_attenuation),
+            make_override<GPUSettings>("dlss_nr_enabled", &GPUSettings::dlss_nr_enabled),
+            make_override<GPUSettings>("dlss_nr_style", &GPUSettings::dlss_nr_style),
+            make_override<GPUSettings>("dlss_nr_intensity", &GPUSettings::dlss_nr_intensity),
+            make_override<GPUSettings>("dlss_nr_ui_correction",
+                                       &GPUSettings::dlss_nr_ui_correction),
             make_override<GPUSettings>("dump_shaders", &GPUSettings::dump_shaders),
             make_override<GPUSettings>("patch_shaders", &GPUSettings::patch_shaders),
             make_override<GPUSettings>("readbacks_mode", &GPUSettings::readbacks_mode),
@@ -457,15 +637,113 @@ struct GPUSettings {
             make_override<GPUSettings>("direct_memory_access_enabled",
                                        &GPUSettings::direct_memory_access_enabled),
             make_override<GPUSettings>("vblank_frequency", &GPUSettings::vblank_frequency),
+            make_override<GPUSettings>("compute_loop_cap", &GPUSettings::compute_loop_cap),
+            make_override<GPUSettings>("preserve_split_protection",
+                                       &GPUSettings::preserve_split_protection),
+            make_override<GPUSettings>("cpu_authoritative_stacks",
+                                       &GPUSettings::cpu_authoritative_stacks),
+            make_override<GPUSettings>("bpe_heap_guard_address",
+                                       &GPUSettings::bpe_heap_guard_address),
+            make_override<GPUSettings>("lds_barrier_uniform_readlane",
+                                       &GPUSettings::lds_barrier_uniform_readlane),
+            make_override<GPUSettings>("early_fragment_tests_from_z_order",
+                                       &GPUSettings::early_fragment_tests_from_z_order),
+            make_override<GPUSettings>("lod_stats_from_bindings",
+                                       &GPUSettings::lod_stats_from_bindings),
+            make_override<GPUSettings>("dynamic_tsharp_array_size",
+                                       &GPUSettings::dynamic_tsharp_array_size),
+            make_override<GPUSettings>("wave64_uniform_branches",
+                                       &GPUSettings::wave64_uniform_branches),
+            make_override<GPUSettings>("wave64_missing_lane_identity",
+                                       &GPUSettings::wave64_missing_lane_identity),
+            make_override<GPUSettings>("lds_barriers_large_groups",
+                                       &GPUSettings::lds_barriers_large_groups),
+            make_override<GPUSettings>("relative_instance_id",
+                                       &GPUSettings::relative_instance_id),
+            make_override<GPUSettings>("gcn_nan_semantics", &GPUSettings::gcn_nan_semantics),
+            make_override<GPUSettings>("legacy_mad_semantics",
+                                       &GPUSettings::legacy_mad_semantics),
+            make_override<GPUSettings>("gpu_checkpoints", &GPUSettings::gpu_checkpoints),
+            make_override<GPUSettings>("srt_walker_clean_reads",
+                                       &GPUSettings::srt_walker_clean_reads),
+            make_override<GPUSettings>("shader_code_clean_reads",
+                                       &GPUSettings::shader_code_clean_reads),
+            make_override<GPUSettings>("readback_ahead", &GPUSettings::readback_ahead),
+            make_override<GPUSettings>("periodic_flush_commands",
+                                       &GPUSettings::periodic_flush_commands),
+            make_override<GPUSettings>("cp_recording_cuts", &GPUSettings::cp_recording_cuts),
+            make_override<GPUSettings>("gpu_overhead_cuts", &GPUSettings::gpu_overhead_cuts),
+            make_override<GPUSettings>("dma_sweep_skip_stacks",
+                                       &GPUSettings::dma_sweep_skip_stacks),
+            make_override<GPUSettings>("wait_spin_us", &GPUSettings::wait_spin_us),
+            make_override<GPUSettings>("readback_ahead_transfer_queue",
+                                       &GPUSettings::readback_ahead_transfer_queue),
+            make_override<GPUSettings>("mapped_page_table", &GPUSettings::mapped_page_table),
+            make_override<GPUSettings>("dma_sync_once_per_batch",
+                                       &GPUSettings::dma_sync_once_per_batch),
+            make_override<GPUSettings>("incremental_bind", &GPUSettings::incremental_bind),
+            make_override<GPUSettings>("tsharp_cache", &GPUSettings::tsharp_cache),
+            make_override<GPUSettings>("wait_marker", &GPUSettings::wait_marker),
+            make_override<GPUSettings>("image_memory_pool", &GPUSettings::image_memory_pool),
+            make_override<GPUSettings>("eop_label_delay_us", &GPUSettings::eop_label_delay_us),
+            make_override<GPUSettings>("cp_record_thread", &GPUSettings::cp_record_thread),
+            make_override<GPUSettings>("force_anisotropy", &GPUSettings::force_anisotropy),
+            make_override<GPUSettings>("readback_hot_regions",
+                                       &GPUSettings::readback_hot_regions),
+            make_override<GPUSettings>("depth_target_sampled_layout",
+                                       &GPUSettings::depth_target_sampled_layout),
+            make_override<GPUSettings>("gcn_unordered_dispatches",
+                                       &GPUSettings::gcn_unordered_dispatches),
+            make_override<GPUSettings>("access_bitmap_tracking",
+                                       &GPUSettings::access_bitmap_tracking),
+            make_override<GPUSettings>("page_spin_locks", &GPUSettings::page_spin_locks),
+            make_override<GPUSettings>("range_fast_paths", &GPUSettings::range_fast_paths),
+            make_override<GPUSettings>("unbounded_vsharp_cap_mb",
+                                       &GPUSettings::unbounded_vsharp_cap_mb),
+            make_override<GPUSettings>("texture_gc_full_scan",
+                                       &GPUSettings::texture_gc_full_scan),
+            make_override<GPUSettings>("texture_gc_trigger_mb",
+                                       &GPUSettings::texture_gc_trigger_mb),
+            make_override<GPUSettings>("image_pool_texture_max_kb",
+                                       &GPUSettings::image_pool_texture_max_kb),
+            make_override<GPUSettings>("arena_evict_idle_s", &GPUSettings::arena_evict_idle_s),
+            make_override<GPUSettings>("inline_fetch_shader", &GPUSettings::inline_fetch_shader),
         };
     }
 };
-NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(GPUSettings, window_width, window_height, internal_screen_width,
-                                   internal_screen_height, null_gpu, copy_gpu_buffers,
-                                   readbacks_mode, readback_linear_images_enabled,
-                                   direct_memory_access_enabled, dump_shaders, patch_shaders,
-                                   vblank_frequency, full_screen, full_screen_mode, present_mode,
-                                   hdr_allowed, fsr_enabled, rcas_enabled, rcas_attenuation)
+// Split the GPU JSON members into two lists to stay below the 64-member macro limit
+#define SHADPS4_GPU_SETTINGS_JSON(op)                                                               \
+    NLOHMANN_JSON_EXPAND(NLOHMANN_JSON_PASTE(                                                       \
+        op, window_width, window_height, internal_screen_width, internal_screen_height, null_gpu,   \
+        copy_gpu_buffers, readbacks_mode, readback_linear_images_enabled,                           \
+        direct_memory_access_enabled, dump_shaders, patch_shaders, vblank_frequency, full_screen,   \
+        full_screen_mode, present_mode, hdr_allowed, fsr_enabled, rcas_enabled, rcas_attenuation,   \
+        compute_loop_cap, preserve_split_protection, cpu_authoritative_stacks,                      \
+        bpe_heap_guard_address, lds_barrier_uniform_readlane, early_fragment_tests_from_z_order,    \
+        lod_stats_from_bindings, dynamic_tsharp_array_size, wave64_uniform_branches,                \
+        wave64_missing_lane_identity, lds_barriers_large_groups, relative_instance_id))             \
+    NLOHMANN_JSON_EXPAND(NLOHMANN_JSON_PASTE(                                                       \
+        op, gcn_nan_semantics, legacy_mad_semantics, gpu_checkpoints, srt_walker_clean_reads,       \
+        shader_code_clean_reads, readback_ahead, periodic_flush_commands, cp_recording_cuts,        \
+        gpu_overhead_cuts, dma_sweep_skip_stacks, wait_spin_us, readback_ahead_transfer_queue,      \
+        mapped_page_table, dma_sync_once_per_batch, incremental_bind, tsharp_cache, wait_marker,    \
+        image_memory_pool, eop_label_delay_us, cp_record_thread, force_anisotropy,                  \
+        readback_hot_regions, depth_target_sampled_layout, gcn_unordered_dispatches,                \
+        access_bitmap_tracking, page_spin_locks, range_fast_paths, unbounded_vsharp_cap_mb,         \
+        texture_gc_full_scan, texture_gc_trigger_mb, image_pool_texture_max_kb,                     \
+        arena_evict_idle_s, dlss_nr_enabled, dlss_nr_style, dlss_nr_intensity,                      \
+        dlss_nr_ui_correction))
+template <typename BasicJsonType,
+          nlohmann::detail::enable_if_t<nlohmann::detail::is_basic_json<BasicJsonType>::value, int> = 0>
+void to_json(BasicJsonType& nlohmann_json_j, const GPUSettings& nlohmann_json_t) {
+    SHADPS4_GPU_SETTINGS_JSON(NLOHMANN_JSON_TO)
+}
+template <typename BasicJsonType,
+          nlohmann::detail::enable_if_t<nlohmann::detail::is_basic_json<BasicJsonType>::value, int> = 0>
+void from_json(const BasicJsonType& nlohmann_json_j, GPUSettings& nlohmann_json_t) {
+    SHADPS4_GPU_SETTINGS_JSON(NLOHMANN_JSON_FROM)
+}
+#undef SHADPS4_GPU_SETTINGS_JSON
 // -------------------------------
 // Vulkan settings
 // -------------------------------
@@ -520,6 +798,9 @@ public:
 
     static std::shared_ptr<EmulatorSettingsImpl> GetInstance();
     static void SetInstance(std::shared_ptr<EmulatorSettingsImpl> instance);
+    /// The current instance without locking or reference counting. Instances replaced by SetInstance are kept
+    /// alive, so a reference taken before the swap stays valid
+    static EmulatorSettingsImpl& Current();
 
     bool Save(const std::string& serial = "");
     bool Load(const std::string& serial = "");
@@ -582,6 +863,8 @@ private:
 
     static std::shared_ptr<EmulatorSettingsImpl> s_instance;
     static std::mutex s_mutex;
+    static std::atomic<EmulatorSettingsImpl*> s_current;
+    static std::vector<std::shared_ptr<EmulatorSettingsImpl>> s_retired;
 
     /// Apply overrideable fields from groupJson into group.game_specific_value.
     template <typename Group>
@@ -609,6 +892,7 @@ private:
     }
 
     static void PrintChangedSummary(const std::vector<std::string>& changed);
+    void ApplyGameOverrides(const nlohmann::json& gj, std::vector<std::string>& changed);
 
 public:
     // Add these getters to access overrideable fields
@@ -690,6 +974,10 @@ public:
     SETTING_FORWARD(m_general, ShadNetWebApiServer, shadnet_webapi_server)
     SETTING_FORWARD(m_general, SignalingInfo, signaling_info)
     SETTING_FORWARD_BOOL(m_general, UPnPEnabled, enable_upnp)
+    SETTING_FORWARD_BOOL(m_general, RedirectApp0Logs, redirect_app0_logs)
+    SETTING_FORWARD(m_general, CpuAffinityMask, cpu_affinity_mask)
+    SETTING_FORWARD_BOOL(m_general, PollConnectedPadsOnly, poll_connected_pads_only)
+    SETTING_FORWARD_BOOL(m_general, SotcPro4k, sotc_pro_4k)
 
     // Log settings
     SETTING_FORWARD_BOOL(m_log, LogAppend, append)
@@ -701,6 +989,7 @@ public:
     SETTING_FORWARD(m_log, LogSizeLimit, size_limit)
     SETTING_FORWARD_BOOL(m_log, LogSkipDuplicate, skip_duplicate)
     SETTING_FORWARD_BOOL(m_log, LogSync, sync)
+    SETTING_FORWARD(m_log, LogConsoleMode, console_mode)
 #ifdef _WIN32
     SETTING_FORWARD(m_log, LogType, type)
 #endif
@@ -715,6 +1004,9 @@ public:
     SETTING_FORWARD(m_audio, OpenALPadSpkOutputDevice, openal_padSpk_output_device)
     SETTING_FORWARD(m_audio, OpenALHrtf, openal_hrtf)
     SETTING_FORWARD(m_audio, OpenALOutputMode, openal_output_mode)
+    SETTING_FORWARD_BOOL(m_audio, AudioFollowGameSpeed, audio_follow_game_speed)
+    SETTING_FORWARD(m_audio, AudioMinGameSpeed, audio_min_game_speed)
+    SETTING_FORWARD(m_audio, AudioGameTargetFps, audio_game_target_fps)
 
     // Windows static guest red-zone protection
     SETTING_FORWARD(m_windows_guest_red_zone_protection, WindowsGuestRedZoneProtectionMode,
@@ -740,11 +1032,60 @@ public:
     SETTING_FORWARD_BOOL(m_gpu, FsrEnabled, fsr_enabled)
     SETTING_FORWARD_BOOL(m_gpu, RcasEnabled, rcas_enabled)
     SETTING_FORWARD(m_gpu, RcasAttenuation, rcas_attenuation)
+    SETTING_FORWARD_BOOL(m_gpu, DlssNrEnabled, dlss_nr_enabled)
+    SETTING_FORWARD(m_gpu, DlssNrStyle, dlss_nr_style)
+    SETTING_FORWARD(m_gpu, DlssNrIntensity, dlss_nr_intensity)
+    SETTING_FORWARD_BOOL(m_gpu, DlssNrUiCorrection, dlss_nr_ui_correction)
     SETTING_FORWARD(m_gpu, ReadbacksMode, readbacks_mode)
     SETTING_FORWARD_BOOL(m_gpu, ReadbackLinearImagesEnabled, readback_linear_images_enabled)
     SETTING_FORWARD_BOOL(m_gpu, DirectMemoryAccessEnabled, direct_memory_access_enabled)
     SETTING_FORWARD_BOOL_READONLY(m_gpu, PatchShaders, patch_shaders)
     SETTING_FORWARD_BOOL(m_gpu, UserfaultfdTracking, userfaultfd)
+    SETTING_FORWARD(m_gpu, ComputeLoopCap, compute_loop_cap)
+    SETTING_FORWARD_BOOL(m_gpu, PreserveSplitProtection, preserve_split_protection)
+    SETTING_FORWARD_BOOL(m_gpu, CpuAuthoritativeStacks, cpu_authoritative_stacks)
+    SETTING_FORWARD(m_gpu, BpeHeapGuardAddress, bpe_heap_guard_address)
+    SETTING_FORWARD_BOOL(m_gpu, LdsBarrierUniformReadlane, lds_barrier_uniform_readlane)
+    SETTING_FORWARD_BOOL(m_gpu, EarlyFragmentTestsFromZOrder, early_fragment_tests_from_z_order)
+    SETTING_FORWARD_BOOL(m_gpu, LodStatsFromBindings, lod_stats_from_bindings)
+    SETTING_FORWARD(m_gpu, DynamicTsharpArraySize, dynamic_tsharp_array_size)
+    SETTING_FORWARD_BOOL(m_gpu, Wave64UniformBranches, wave64_uniform_branches)
+    SETTING_FORWARD_BOOL(m_gpu, Wave64MissingLaneIdentity, wave64_missing_lane_identity)
+    SETTING_FORWARD_BOOL(m_gpu, LdsBarriersLargeGroups, lds_barriers_large_groups)
+    SETTING_FORWARD_BOOL(m_gpu, RelativeInstanceId, relative_instance_id)
+    SETTING_FORWARD_BOOL(m_gpu, GcnNanSemantics, gcn_nan_semantics)
+    SETTING_FORWARD_BOOL(m_gpu, LegacyMadSemantics, legacy_mad_semantics)
+    SETTING_FORWARD_BOOL(m_gpu, GpuCheckpoints, gpu_checkpoints)
+    SETTING_FORWARD_BOOL(m_gpu, SrtWalkerCleanReads, srt_walker_clean_reads)
+    SETTING_FORWARD_BOOL(m_gpu, ShaderCodeCleanReads, shader_code_clean_reads)
+    SETTING_FORWARD_BOOL(m_gpu, ReadbackAhead, readback_ahead)
+    SETTING_FORWARD(m_gpu, PeriodicFlushCommands, periodic_flush_commands)
+    SETTING_FORWARD_BOOL(m_gpu, CpRecordingCuts, cp_recording_cuts)
+    SETTING_FORWARD_BOOL(m_gpu, GpuOverheadCuts, gpu_overhead_cuts)
+    SETTING_FORWARD_BOOL(m_gpu, DmaSweepSkipStacks, dma_sweep_skip_stacks)
+    SETTING_FORWARD(m_gpu, WaitSpinUs, wait_spin_us)
+    SETTING_FORWARD_BOOL(m_gpu, ReadbackAheadTransferQueue, readback_ahead_transfer_queue)
+    SETTING_FORWARD_BOOL(m_gpu, MappedPageTable, mapped_page_table)
+    SETTING_FORWARD_BOOL(m_gpu, DmaSyncOncePerBatch, dma_sync_once_per_batch)
+    SETTING_FORWARD_BOOL(m_gpu, IncrementalBind, incremental_bind)
+    SETTING_FORWARD_BOOL(m_gpu, TsharpCache, tsharp_cache)
+    SETTING_FORWARD(m_gpu, WaitMarker, wait_marker)
+    SETTING_FORWARD_BOOL(m_gpu, ImageMemoryPool, image_memory_pool)
+    SETTING_FORWARD(m_gpu, EopLabelDelayUs, eop_label_delay_us)
+    SETTING_FORWARD_BOOL(m_gpu, CpRecordThread, cp_record_thread)
+    SETTING_FORWARD(m_gpu, ForceAnisotropy, force_anisotropy)
+    SETTING_FORWARD_BOOL(m_gpu, ReadbackHotRegions, readback_hot_regions)
+    SETTING_FORWARD_BOOL(m_gpu, DepthTargetSampledLayout, depth_target_sampled_layout)
+    SETTING_FORWARD_BOOL(m_gpu, GcnUnorderedDispatches, gcn_unordered_dispatches)
+    SETTING_FORWARD_BOOL(m_gpu, AccessBitmapTracking, access_bitmap_tracking)
+    SETTING_FORWARD_BOOL(m_gpu, PageSpinLocks, page_spin_locks)
+    SETTING_FORWARD_BOOL(m_gpu, RangeFastPaths, range_fast_paths)
+    SETTING_FORWARD(m_gpu, UnboundedVsharpCapMb, unbounded_vsharp_cap_mb)
+    SETTING_FORWARD_BOOL(m_gpu, TextureGcFullScan, texture_gc_full_scan)
+    SETTING_FORWARD(m_gpu, TextureGcTriggerMb, texture_gc_trigger_mb)
+    SETTING_FORWARD(m_gpu, ImagePoolTextureMaxKb, image_pool_texture_max_kb)
+    SETTING_FORWARD(m_gpu, ArenaEvictIdleS, arena_evict_idle_s)
+    SETTING_FORWARD_BOOL_READONLY(m_gpu, InlineFetchShader, inline_fetch_shader)
 
     u32 GetVblankFrequency() {
         if (m_gpu.vblank_frequency.value < 30) {

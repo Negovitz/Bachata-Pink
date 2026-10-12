@@ -4,7 +4,9 @@
 #include "common/debug.h"
 #include "common/elf_info.h"
 #include "common/io_file.h"
+#include "common/harness.h"
 #include "common/path_util.h"
+#include "common/perf_stats.h"
 #include "common/singleton.h"
 #include "core/debug_state.h"
 #include "core/devtools/layer.h"
@@ -466,7 +468,9 @@ Presenter::Presenter(Frontend::WindowSDL& window_, AmdGpu::Liverpool* liverpool_
     : window{window_}, liverpool{liverpool_},
       instance{window, EmulatorSettings.GetGpuId(), EmulatorSettings.IsVkValidationEnabled(),
                EmulatorSettings.IsVkCrashDiagnosticEnabled()},
-      draw_scheduler{instance}, present_scheduler{instance}, flip_scheduler{instance},
+      draw_scheduler{instance, EmulatorSettings.IsCpRecordThread() ||
+                                    Common::PerfStats::AbToggleLists("cp_record_thread")}, present_scheduler{instance},
+      flip_scheduler{instance},
       swapchain{instance, window}, runtime{instance, draw_scheduler},
       rasterizer{std::make_unique<Rasterizer>(instance, draw_scheduler, runtime, liverpool)},
       texture_cache{rasterizer->GetTextureCache()} {
@@ -492,6 +496,13 @@ Presenter::Presenter(Frontend::WindowSDL& window_, AmdGpu::Liverpool* liverpool_
     fsr_pass.Create(device, instance.GetAllocator(), num_images);
     pp_pass.Create(device, swapchain.GetSurfaceFormat().format);
 
+    dlssnr_settings.style = std::min(EmulatorSettings.GetDlssNrStyle(), 2u);
+    dlssnr_settings.intensity =
+        std::clamp(static_cast<float>(EmulatorSettings.GetDlssNrIntensity()), 0.0f, 2.0f);
+    dlssnr_settings.ui_correction = EmulatorSettings.IsDlssNrUiCorrection();
+    HostPasses::DlssNrPass::SetEnabled(EmulatorSettings.IsDlssNrEnabled());
+    dlssnr_pass.Create(instance, draw_scheduler);
+
     ImGui::Layer::AddLayer(Common::Singleton<Core::Devtools::Layer>::Instance());
     ImGui::Friends::Register();
     ImGui::ShadNetNotify::Register();
@@ -504,12 +515,16 @@ Presenter::~Presenter() {
     ImGui::Friends::Unregister();
     ImGui::Layer::RemoveLayer(Common::Singleton<Core::Devtools::Layer>::Instance());
 
+    // This thread records the last commands for the rasterizer scheduler, so it must take over as
+    // the producer when cp_record_thread is active
+    draw_scheduler.ClaimRecorder();
     draw_scheduler.Finish();
     present_scheduler.Finish();
     flip_scheduler.Finish();
     Check(draw_scheduler.CommandBuffer().reset());
     Check(present_scheduler.CommandBuffer().reset());
     Check(flip_scheduler.CommandBuffer().reset());
+    dlssnr_pass.Destroy();
 
     const vk::Device device = instance.GetDevice();
     for (auto& frame : present_frames) {
@@ -606,6 +621,9 @@ Frame* Presenter::PrepareLastFrame() {
         }
         if (result == vk::Result::eTimeout) {
             continue;
+        }
+        if (result == vk::Result::eErrorDeviceLost) {
+            instance.ReportDeviceFault("PrepareLastFrame");
         }
         ASSERT_MSG(result != vk::Result::eErrorDeviceLost,
                    "Device lost during waiting for a frame");
@@ -748,6 +766,14 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
     pp_settings.srgb_input =
         attribute.attrib.pixel_format == Libraries::VideoOut::PixelFormat::A2R10G10B10Srgb;
     pp_pass.Render(cmdbuf, image_view, image_size, *frame, pp_settings);
+    // The FSR and post-process passes bind their pipelines directly
+    draw_scheduler.InvalidatePipelineBinds();
+
+    // Run DLSS Neural Rendering on the finished frame before drawing overlays
+    // Submit the frame so far and make the final submit wait for the model
+    SubmitInfo info{};
+    dlssnr_pass.Render(frame->image, swapchain.GetSurfaceFormat().format, frame->width,
+                       frame->height, frame->is_hdr, dlssnr_settings, info);
 
     DebugState.game_resolution = {image_size.width, image_size.height};
     DebugState.output_resolution = {frame->width, frame->height};
@@ -762,7 +788,6 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
     // Flush frame creation commands.
     frame->ready_semaphore = draw_scheduler.GetWorkSemaphore()->Handle();
     frame->ready_tick = draw_scheduler.CurrentTick();
-    SubmitInfo info{};
     draw_scheduler.Flush(info);
     return frame;
 }
@@ -1065,6 +1090,11 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
         });
     }
 
+    if (frame->ready_semaphore == draw_scheduler.GetWorkSemaphore()->Handle()) {
+        // The recording thread may still be preparing this frame's submit, so wait until it reaches
+        // the queue before presenting
+        draw_scheduler.WaitSubmitted(frame->ready_tick);
+    }
     SubmitInfo info{};
     info.AddWait(swapchain.GetImageAcquiredSemaphore());
     info.AddWait(frame->ready_semaphore, frame->ready_tick);
@@ -1080,9 +1110,73 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
         }
     }
 
+    VideoCore::PollScheduledCaptures();
+    ReportDiagnostics(is_reusing_frame, is_game_frame);
+
     free_frame();
     if (!is_reusing_frame && is_game_frame) {
         DebugState.IncFlipFrameNum();
+    }
+}
+
+void Presenter::ReportDiagnostics(bool is_reusing_frame, bool is_game_frame) {
+    const bool new_game_frame = !is_reusing_frame && is_game_frame;
+    // SHADPS4_PERF_STATS: frame-cost counters since the previous report (common/perf_stats.h)
+    if (Common::PerfStats::Enabled()) {
+        static u64 perf_game_frames = 0;
+        static u64 perf_presentations = 0;
+        static auto perf_last_report = std::chrono::steady_clock::now();
+        static const auto perf_first_report = perf_last_report;
+        ++perf_presentations;
+        perf_game_frames += new_game_frame;
+        const auto now = std::chrono::steady_clock::now();
+        if (now - perf_last_report >= std::chrono::seconds{10}) {
+            const auto interval_ms =
+                std::chrono::duration_cast<std::chrono::milliseconds>(now - perf_last_report)
+                    .count();
+            LOG_WARNING(Render_Vulkan,
+                        "Harness perf: interval_ms={} game_frames={} presentations={} {}",
+                        interval_ms, perf_game_frames, perf_presentations,
+                        Common::PerfStats::TakeReport());
+            LOG_WARNING(Render_Vulkan, "Harness perf faults: {}",
+                        Common::PerfStats::TakeFaultRegionReport());
+            perf_game_frames = 0;
+            perf_presentations = 0;
+            perf_last_report = now;
+            Common::PerfStats::OnReportEmitted(
+                std::chrono::duration<double>(now - perf_first_report).count());
+        }
+    }
+    // SHADPS4_HARNESS_PROGRESS: progress independent of image changes (a static menu may still present new
+    // frames), with VRAM use and the texture cache size
+    if (Common::HarnessEnabled()) {
+        static u64 presentation_count = 0;
+        static u64 game_frame_count = 0;
+        static auto last_report = std::chrono::steady_clock::now();
+        ++presentation_count;
+        game_frame_count += new_game_frame;
+        const auto now = std::chrono::steady_clock::now();
+        if (now - last_report >= std::chrono::seconds{10}) {
+            std::array<VmaBudget, VK_MAX_MEMORY_HEAPS> budgets{};
+            vmaGetHeapBudgets(instance.GetAllocator(), budgets.data());
+            const auto heaps = instance.GetPhysicalDevice().getMemoryProperties().memoryHeaps;
+            u64 vram_usage = 0;
+            u64 vram_budget = 0;
+            for (u32 i = 0; i < VK_MAX_MEMORY_HEAPS; ++i) {
+                if ((heaps[i].flags & vk::MemoryHeapFlagBits::eDeviceLocal) &&
+                    budgets[i].budget > vram_budget) {
+                    vram_usage = budgets[i].usage;
+                    vram_budget = budgets[i].budget;
+                }
+            }
+            const auto [images, largest_image] = rasterizer->GetTextureCache().GetImageStats();
+            LOG_WARNING(Render_Vulkan,
+                        "Harness progress: presentations={} game_frames={} vram_mb={} "
+                        "vram_budget_mb={} images={} largest_image_mb={}",
+                        presentation_count, game_frame_count, vram_usage >> 20, vram_budget >> 20,
+                        images, largest_image >> 20);
+            last_report = now;
+        }
     }
 }
 
@@ -1109,6 +1203,9 @@ Frame* Presenter::GetRenderFrame() {
 
     // Wait for the presentation to be finished so all frame resources are free
     while (wait() != vk::Result::eSuccess) {
+        if (result == vk::Result::eErrorDeviceLost) {
+            instance.ReportDeviceFault("GetRenderFrame");
+        }
         ASSERT_MSG(result != vk::Result::eErrorDeviceLost,
                    "Device lost during waiting for a frame");
         // Retry if the waiting times out

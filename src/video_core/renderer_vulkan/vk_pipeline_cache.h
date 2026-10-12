@@ -3,14 +3,21 @@
 
 #pragma once
 
+#include <algorithm>
+#include <functional>
+#include <optional>
+#include <utility>
 #include <variant>
+#include <boost/container/small_vector.hpp>
 #include <tsl/robin_map.h>
+#include "common/assert.h"
 #include "shader_recompiler/profile.h"
 #include "shader_recompiler/recompiler.h"
 #include "shader_recompiler/specialization.h"
 #include "video_core/renderer_vulkan/vk_compute_pipeline.h"
 #include "video_core/renderer_vulkan/vk_graphics_pipeline.h"
 #include "video_core/renderer_vulkan/vk_resource_pool.h"
+#include "vulkan/vulkan.hpp"
 
 template <>
 struct std::hash<vk::ShaderModule> {
@@ -47,12 +54,20 @@ struct Program {
 
     Shader::Info info;
     ModuleList modules{};
+    /// Keep the indices of occupied modules slots in ascending order so searches skip the empty
+    /// slots
+    /// Stored permutation indices can leave gaps, and checking those gaps was most of the work in
+    /// the old search
+    /// AllocateShaderBinaryIndex keeps the stored indices stable, so we must keep the same order
+    /// without renumbering them
+    boost::container::small_vector<u32, MaxPermutations> valid_permuts{};
 
     Program() = default;
     Program(Shader::HwStage stage, Shader::SwStage l_stage, Shader::ShaderParams params)
         : info{stage, l_stage, params} {}
 
     void AddPermut(vk::ShaderModule module, Shader::StageSpecialization&& spec) {
+        valid_permuts.push_back(static_cast<u32>(modules.size()));
         modules.emplace_back(module, std::move(spec));
     }
 
@@ -60,6 +75,27 @@ struct Program {
                       size_t perm_idx) {
         modules.resize(std::max(modules.size(), perm_idx + 1)); // <-- beware of realloc
         modules[perm_idx] = {module, std::move(spec)};
+        const auto it = std::ranges::lower_bound(valid_permuts, static_cast<u32>(perm_idx));
+        if (it == valid_permuts.end() || *it != perm_idx) {
+            valid_permuts.insert(it, static_cast<u32>(perm_idx));
+        }
+    }
+
+    /// Find the first occupied permutation with a matching specialization, keeping the same index
+    /// order as a full modules search
+    /// Skipping an empty slot should never change which matching permutation is selected
+    std::optional<size_t> FindPermut(const Shader::StageSpecialization& spec) const {
+        std::optional<size_t> found{};
+        for (const u32 idx : valid_permuts) {
+            if (modules[idx].spec == spec) {
+                found = idx;
+                break;
+            }
+        }
+        DEBUG_ASSERT(found.value_or(modules.size()) ==
+                     static_cast<size_t>(std::distance(
+                         modules.begin(), std::ranges::find(modules, spec, &Module::spec))));
+        return found;
     }
 };
 
@@ -85,9 +121,8 @@ public:
 
     const ComputePipeline* GetComputePipeline();
 
-    using Result = std::tuple<const Shader::Info*, vk::ShaderModule,
-                              std::optional<Shader::Gcn::FetchShaderData>, u64>;
-    Result GetProgram(Shader::HwStage stage, Shader::SwStage l_stage,
+    using Result = std::tuple<const Shader::Info*, vk::ShaderModule, u64>;
+    Result GetProgram(Shader::HwStage hw_stage, Shader::SwStage sw_stage,
                       const Shader::ShaderParams& params, Shader::Backend::Bindings& binding);
 
     std::optional<vk::ShaderModule> ReplaceShader(vk::ShaderModule module,
@@ -100,7 +135,27 @@ public:
         return profile;
     }
 
+    /// Clean guest memory reader provided by the rasterizer
+    std::function<bool(VAddr, void*, u64)> read_clean_memory;
+    /// Whether BindTextures binds this single T# as null
+    /// (Rasterizer::CheckBindableImage), set by the rasterizer
+    std::function<bool(const AmdGpu::Image&, const Shader::ImageResource&)> is_null_image;
+
 private:
+    /// Cached shader metadata and the guest bytes used to find it
+    struct CachedBinaryInfo {
+        // Search ranges and their bytes in order
+        boost::container::small_vector<std::pair<u64, u32>, 2> ranges;
+        std::vector<u8> bytes;
+        AmdGpu::BinaryInfo info;
+    };
+
+    /// Reuse shader parameters while the code bytes stay unchanged and return nullopt when no
+    /// valid binary info is found, so the caller can skip the draw or dispatch safely
+    template <typename Program>
+    std::optional<Shader::ShaderParams> GetParamsCached(const Program& pgm);
+    bool CachedBytesMatch(const u32* code, const CachedBinaryInfo& cached);
+
     bool RefreshGraphicsKey();
     bool RefreshGraphicsStages();
     bool RefreshComputeKey();
@@ -111,7 +166,7 @@ private:
                                                    std::string_view ext);
     vk::ShaderModule CompileModule(Shader::Info& info, Shader::RuntimeInfo& runtime_info,
                                    const std::span<const u32>& code, size_t perm_idx,
-                                   Shader::Backend::Bindings& binding);
+                                   Shader::Backend::Bindings& binding, bool store = true);
     const Shader::RuntimeInfo& BuildRuntimeInfo(Shader::HwStage stage, Shader::SwStage l_stage);
 
     [[nodiscard]] bool IsPipelineCacheDirty() const {
@@ -134,10 +189,12 @@ private:
     std::array<Shader::RuntimeInfo, MaxShaderStages> runtime_infos{};
     std::array<const Shader::Info*, MaxShaderStages> infos{};
     std::array<vk::ShaderModule, MaxShaderStages> modules{};
-    std::optional<Shader::Gcn::FetchShaderData> fetch_shader{};
+    Shader::Gcn::FetchShaderData* fetch_shader{};
     GraphicsPipelineKey graphics_key{};
     ComputePipelineKey compute_key{};
     u32 num_new_pipelines{}; // new pipelines added to the cache since the game start
+    tsl::robin_map<const u32*, CachedBinaryInfo> binary_info_cache;
+    std::vector<u8> code_scratch;
 
     // Only if Config::collectShadersForDebug()
     tsl::robin_map<vk::ShaderModule,

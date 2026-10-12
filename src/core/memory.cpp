@@ -1,10 +1,14 @@
 // SPDX-FileCopyrightText: Copyright 2025-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cstdlib>
+
 #include "common/alignment.h"
 #include "common/assert.h"
 #include "common/debug.h"
 #include "common/elf_info.h"
+#include "common/guest_write_journal.h"
+#include "common/perf_stats.h"
 #include "core/emulator_settings.h"
 #include "core/file_sys/fs.h"
 #include "core/libraries/kernel/memory.h"
@@ -145,28 +149,31 @@ void MemoryManager::SetPrtArea(u32 id, VAddr address, u64 size) {
 }
 
 void MemoryManager::CopySparseMemory(VAddr virtual_addr, u8* dest, u64 size) {
-    std::shared_lock lk{mutex};
-    ASSERT_MSG(IsValidMapping(virtual_addr), "Attempted to access invalid address {:#x}",
-               virtual_addr);
-
-    auto vma = FindVMA(virtual_addr);
+    const auto& backing_pages = impl.BackingPages();
     while (size) {
-        const u64 offset = virtual_addr - vma->first;
-        const u64 copy_size = std::min<u64>(vma->second.size - (virtual_addr - vma->first), size);
-        if (vma->second.IsMapped()) {
-            u8* out = dest;
-            vma->second.ForEachPhysArea(offset, copy_size, [&](PAddr paddr, u32 chunk_size) {
-                std::memcpy(out, impl.BackingBase() + paddr, chunk_size);
-                out += chunk_size;
-            });
+        const u64 page = virtual_addr >> 14;
+        const u64 offset_in_page = virtual_addr % 16_KB;
+        const u64 copy_size = std::min<u64>(16_KB - offset_in_page, size);
+        if (auto* entry = backing_pages.find(page); entry && *entry) {
+            std::memcpy(dest, *entry + offset_in_page, copy_size);
         } else {
             std::memset(dest, 0, copy_size);
         }
         size -= copy_size;
         virtual_addr += copy_size;
         dest += copy_size;
-        ++vma;
     }
+}
+
+const u8* MemoryManager::GetBackingPointer(VAddr virtual_addr) const {
+    if (virtual_addr >> AddressSpace::Traits::ADDRESS_SPACE_BITS) {
+        return nullptr;
+    }
+    const auto* entry = impl.BackingPages().find(virtual_addr >> AddressSpace::Traits::PAGE_BITS);
+    if (!entry || !*entry) {
+        return nullptr;
+    }
+    return *entry + (virtual_addr & ((1ULL << AddressSpace::Traits::PAGE_BITS) - 1));
 }
 
 bool MemoryManager::TryWriteBacking(void* address, const void* data, u64 size) {
@@ -189,6 +196,8 @@ bool MemoryManager::TryWriteBacking(void* address, const void* data, u64 size) {
         return false;
     }
 
+    // Each physical piece receives its own slice of the source
+    const u8* src = static_cast<const u8*>(data);
     for (auto& vma : vmas_to_write) {
         auto start_in_vma = std::max<VAddr>(virtual_addr, vma.base) - vma.base;
         auto phys_handle = std::prev(vma.phys_areas.upper_bound(start_in_vma));
@@ -200,12 +209,69 @@ bool MemoryManager::TryWriteBacking(void* address, const void* data, u64 size) {
                 std::max<u64>(start_in_vma, phys_handle->first) - phys_handle->first;
             u8* backing = impl.BackingBase() + phys_handle->second.base + start_in_dma;
             u64 copy_size = std::min<u64>(size, phys_handle->second.size - start_in_dma);
-            memcpy(backing, data, copy_size);
+            memcpy(backing, src, copy_size);
+            src += copy_size;
             size -= copy_size;
         }
     }
 
     return true;
+}
+
+bool MemoryManager::TryReadBacking(VAddr virtual_addr, void* out, u64 size) {
+    std::shared_lock lk{mutex};
+    if (!IsValidMapping(virtual_addr, size)) {
+        return false;
+    }
+    u8* dst = static_cast<u8*>(out);
+    auto vma = FindVMA(virtual_addr);
+    while (size) {
+        if (vma == vma_map.end() || !vma->second.Overlaps(virtual_addr, size) ||
+            !HasPhysicalBacking(vma->second)) {
+            return false;
+        }
+        const u64 start_in_vma = virtual_addr - vma->second.base;
+        auto phys = std::prev(vma->second.phys_areas.upper_bound(start_in_vma));
+        const u64 start_in_phys = start_in_vma - phys->first;
+        if (start_in_phys >= phys->second.size) {
+            return false;
+        }
+        const u64 copy_size = std::min<u64>(size, phys->second.size - start_in_phys);
+        std::memcpy(dst, impl.BackingBase() + phys->second.base + start_in_phys, copy_size);
+        dst += copy_size;
+        virtual_addr += copy_size;
+        size -= copy_size;
+        if (virtual_addr >= vma->second.base + vma->second.size) {
+            ++vma;
+        }
+    }
+    return true;
+}
+
+const u8* MemoryManager::GetBackingRun(VAddr virtual_addr, VAddr* run_start, u64* run_size,
+                                       bool try_lock) {
+    std::shared_lock lk{mutex, std::defer_lock};
+    if (!try_lock) {
+        lk.lock();
+    } else if (!lk.try_lock()) {
+        return nullptr;
+    }
+    if (!IsValidMapping(virtual_addr, 1)) {
+        return nullptr;
+    }
+    const auto vma = FindVMA(virtual_addr);
+    if (vma == vma_map.end() || !vma->second.Overlaps(virtual_addr, 1) ||
+        !HasPhysicalBacking(vma->second)) {
+        return nullptr;
+    }
+    const u64 start_in_vma = virtual_addr - vma->second.base;
+    const auto phys = std::prev(vma->second.phys_areas.upper_bound(start_in_vma));
+    if (start_in_vma - phys->first >= phys->second.size) {
+        return nullptr;
+    }
+    *run_start = vma->second.base + phys->first;
+    *run_size = std::min<u64>(phys->second.size, vma->second.size - phys->first);
+    return impl.BackingBase() + phys->second.base;
 }
 
 PAddr MemoryManager::PoolExpand(PAddr search_start, PAddr search_end, u64 size, u64 alignment) {
@@ -682,7 +748,6 @@ s32 MemoryManager::MapMemory(void** out_addr, VAddr virtual_addr, u64 size, Memo
         MergeAdjacent(vma_map, new_vma_handle);
     }
 
-    *out_addr = std::bit_cast<void*>(mapped_addr);
     if (type != VMAType::Reserved && type != VMAType::PoolReserved) {
         // Flexible address space mappings were performed while finding direct memory areas.
         if (type != VMAType::Flexible) {
@@ -700,6 +765,12 @@ s32 MemoryManager::MapMemory(void** out_addr, VAddr virtual_addr, u64 size, Memo
         }
     }
 
+    // The guest pointer is written without the writer lock: if the write faults on a tracked page, the fault
+    // handler may need this lock (backing reads/writes, texture cache refresh)
+    if (lk2.owns_lock()) {
+        lk2.unlock();
+    }
+    *out_addr = std::bit_cast<void*>(mapped_addr);
     return ORBIS_OK;
 }
 
@@ -782,7 +853,7 @@ s32 MemoryManager::MapFile(void** out_addr, VAddr virtual_addr, u64 size, Memory
     }
 
     // Aquire writer lock
-    std::scoped_lock lk2{mutex};
+    std::unique_lock lk2{mutex};
 
     // Update VMA map and map to address space.
     auto new_vma_handle = CreateArea(virtual_addr, size, prot, flags, VMAType::File, "anon", 0);
@@ -825,6 +896,8 @@ s32 MemoryManager::MapFile(void** out_addr, VAddr virtual_addr, u64 size, Memory
         rasterizer->RegisterMemory(mapped_addr, size);
     }
 
+    // Written without the writer lock, as in MapMemory
+    lk2.unlock();
     *out_addr = std::bit_cast<void*>(mapped_addr);
     return ORBIS_OK;
 }
@@ -1114,6 +1187,8 @@ s64 MemoryManager::ProtectBytes(VAddr addr, VirtualMemoryArea& vma_base, u64 siz
 
     // Perform address-space memory protections if needed.
     if (new_prot != old_prot) {
+        Common::GuestWriteJournal::Record(Common::GuestWriteJournal::Source::GuestProtect, addr,
+                                          adjusted_size, nullptr, static_cast<u64>(prot));
         impl.Protect(addr, adjusted_size, perms);
     }
 
@@ -1665,6 +1740,120 @@ MemoryManager::PhysHandle MemoryManager::Split(PhysMap& map, PhysHandle phys_han
     new_area.size -= offset_in_area;
 
     return map.emplace_hint(std::next(phys_handle), new_area.base, new_area);
+}
+
+// Host page protection is page granular, so a stack that is not page aligned (fiber contexts are carved out
+// of the heap) must exclude the whole pages it touches
+static constexpr u64 StackPageSize = 4_KB;
+
+void MemoryManager::RegisterStackRange(VAddr virtual_addr, u64 size) {
+    if (size == 0 || !EmulatorSettings.IsCpuAuthoritativeStacks()) {
+        return;
+    }
+    const VAddr start = Common::AlignDown(virtual_addr, StackPageSize);
+    const VAddr end = Common::AlignUp(virtual_addr + size, StackPageSize);
+    stack_ranges.Add(start, end);
+    Common::GuestWriteJournal::Record(Common::GuestWriteJournal::Source::StackRegister, start,
+                                      end - start, nullptr, virtual_addr);
+    // The range may already be write-protected by GPU memory tracking (e.g. a fiber context carved out of a
+    // heap that the GPU also reads). Restore write access right away: tracking faults can never be delivered
+    // on a read-only stack page
+    if (IsValidMappingLocked(start, end - start)) {
+        impl.Protect(start, end - start, MemoryPermission::ReadWrite);
+    }
+}
+
+void MemoryManager::UnregisterStackRange(VAddr virtual_addr, u64 size) {
+    if (size == 0 || !stack_ranges.HasRanges()) {
+        return;
+    }
+    // Same page rounding as RegisterStackRange: the counts keep pages shared with another live stack excluded
+    const VAddr start = Common::AlignDown(virtual_addr, StackPageSize);
+    const VAddr end = Common::AlignUp(virtual_addr + size, StackPageSize);
+    stack_ranges.Remove(start, end);
+    Common::GuestWriteJournal::Record(Common::GuestWriteJournal::Source::StackUnregister, start,
+                                      end - start, nullptr, virtual_addr);
+    // The game reuses the memory (e.g. as allocator metadata of a fiber heap). Hand the parts that are no
+    // longer any stack back to normal tracking as CPU-modified, so no stale GPU data is ever downloaded over
+    // them
+    if (rasterizer) {
+        for (const auto& [lo, len] : SubtractStackRanges(start, end - start)) {
+            rasterizer->ReleaseCpuAuthoritativeRange(lo, len);
+        }
+    }
+}
+
+void MemoryManager::SetRasterizer(Vulkan::Rasterizer* rasterizer_) {
+    rasterizer = rasterizer_;
+    const bool enabled = EmulatorSettings.IsRangeFastPaths();
+    stack_copy_toggle = Common::PerfStats::AbToggleFollows("range_fast_paths");
+    stack_copy_verify = enabled && std::getenv("SHADPS4_RANGE_FAST_VERIFY") != nullptr;
+    stack_copy_queries.store(enabled, std::memory_order_release);
+}
+
+bool MemoryManager::StackCopyOn() const {
+    return stack_copy_queries.load(std::memory_order_acquire) &&
+           Common::PerfStats::AbToggleOn(stack_copy_toggle);
+}
+
+namespace {
+void StackMismatch(const char* what, VAddr addr, u64 size) {
+    static std::atomic<u32> mismatches{0};
+    Common::PerfStats::Add(Common::PerfStats::Id::RangeFastMismatches);
+    if (mismatches.fetch_add(1, std::memory_order_relaxed) < 32) {
+        LOG_ERROR(Kernel_Vmm, "range_fast_paths verify: {} differs at {:#x}+{:#x}", what, addr,
+                  size);
+    }
+}
+} // Anonymous namespace
+
+bool MemoryManager::OverlapsStackRange(VAddr virtual_addr, u64 size) {
+    if (!StackCopyOn()) {
+        return stack_ranges.Overlaps(virtual_addr, size);
+    }
+    if (!stack_copy_verify) [[likely]] {
+        return stack_ranges.Overlaps(virtual_addr, size, true);
+    }
+    // A stack (un)registered between the two queries is not a mismatch
+    const u64 generation = stack_ranges.Generation();
+    const bool fast = stack_ranges.Overlaps(virtual_addr, size, true);
+    const bool slow = stack_ranges.Overlaps(virtual_addr, size);
+    if (fast != slow && generation == stack_ranges.Generation()) {
+        StackMismatch("OverlapsStackRange", virtual_addr, size);
+    }
+    return slow;
+}
+
+MemoryManager::StackPieces MemoryManager::SubtractStackRanges(VAddr virtual_addr, u64 size) {
+    if (!StackCopyOn()) {
+        return stack_ranges.Subtract(virtual_addr, size);
+    }
+    if (!stack_copy_verify) [[likely]] {
+        return stack_ranges.Subtract(virtual_addr, size, true);
+    }
+    const u64 generation = stack_ranges.Generation();
+    const auto fast = stack_ranges.Subtract(virtual_addr, size, true);
+    auto slow = stack_ranges.Subtract(virtual_addr, size);
+    if (fast != slow && generation == stack_ranges.Generation()) {
+        StackMismatch("SubtractStackRanges", virtual_addr, size);
+    }
+    return slow;
+}
+
+MemoryManager::StackPieces MemoryManager::GetStackRangesIn(VAddr virtual_addr, u64 size) {
+    if (!StackCopyOn()) {
+        return stack_ranges.GetIn(virtual_addr, size);
+    }
+    if (!stack_copy_verify) [[likely]] {
+        return stack_ranges.GetIn(virtual_addr, size, true);
+    }
+    const u64 generation = stack_ranges.Generation();
+    const auto fast = stack_ranges.GetIn(virtual_addr, size, true);
+    auto slow = stack_ranges.GetIn(virtual_addr, size);
+    if (fast != slow && generation == stack_ranges.Generation()) {
+        StackMismatch("GetStackRangesIn", virtual_addr, size);
+    }
+    return slow;
 }
 
 } // namespace Core

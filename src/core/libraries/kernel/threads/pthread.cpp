@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include "common/assert.h"
+#include "common/cp_profiler.h"
 #include "common/thread.h"
 #ifdef _WIN32
 #include "common/ntapi.h"
@@ -257,6 +258,7 @@ static void* RunThread(void* arg) {
     auto* curthread = static_cast<Pthread*>(arg);
     g_curthread = curthread;
     Common::SetCurrentThreadName(curthread->name.c_str());
+    Common::CpProfiler::RegisterGuestThread(curthread->name.c_str());
     DebugState.AddCurrentThreadToGuestList();
     Core::InitializeTLS();
 
@@ -321,6 +323,11 @@ int PS4_SYSV_ABI posix_pthread_create_name_np(PthreadT* thread, const PthreadAtt
         thread_state->Free(curthread, new_thread);
         return POSIX_EAGAIN;
     }
+
+    // Both emulator-allocated and user-provided stacks must stay writable for the host to dispatch exceptions
+    // raised while running on them (cpu_authoritative_stacks)
+    Core::Memory::Instance()->RegisterStackRange(
+        std::bit_cast<VAddr>(new_thread->attr.stackaddr_attr), new_thread->attr.stacksize_attr);
 
     /*
      * Write a magic value to the thread structure

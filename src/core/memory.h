@@ -3,16 +3,20 @@
 
 #pragma once
 
+#include <atomic>
 #include <map>
 #include <mutex>
+#include <shared_mutex>
 #include <string>
 #include <string_view>
+#include <utility>
 #include "common/enum.h"
 #include "common/shared_first_mutex.h"
 #include "common/singleton.h"
 #include "common/types.h"
 #include "core/address_space.h"
 #include "core/libraries/kernel/memory.h"
+#include "core/stack_ranges.h"
 
 namespace Vulkan {
 class Rasterizer;
@@ -181,9 +185,8 @@ public:
     explicit MemoryManager();
     ~MemoryManager();
 
-    void SetRasterizer(Vulkan::Rasterizer* rasterizer_) {
-        rasterizer = rasterizer_;
-    }
+    /// Also reads range_fast_paths, with the game's settings loaded
+    void SetRasterizer(Vulkan::Rasterizer* rasterizer_);
 
     AddressSpace& GetAddressSpace() {
         return impl;
@@ -203,6 +206,11 @@ public:
 
     VAddr SystemReservedVirtualBase() noexcept {
         return impl.SystemReservedVirtualBase();
+    }
+
+    /// Start of the guest address space: no guest memory lies below it
+    VAddr SystemManagedVirtualBase() noexcept {
+        return impl.SystemManagedVirtualBase();
     }
 
     bool IsValidGpuMapping(VAddr virtual_addr, u64 size) {
@@ -254,6 +262,10 @@ public:
 
     void CopySparseMemory(VAddr source, u8* dest, u64 size);
 
+    /// Lock free, from the table CopySparseMemory reads: host pointer to the physical backing of virtual_addr,
+    /// valid up to the end of its 16 KiB page while the mapping lasts, or nullptr without a physical backing
+    const u8* GetBackingPointer(VAddr virtual_addr) const;
+
     bool TryWriteBacking(void* address, const void* data, u64 size);
 
     void SetupMemoryRegions(u64 flexible_size, bool use_extended_mem1, bool use_extended_mem2);
@@ -304,6 +316,53 @@ public:
 
     void InvalidateMemory(VAddr addr, u64 size) const;
 
+    /// IsValidMapping for callers that do not hold the memory manager lock (other threads map and unmap
+    /// concurrently)
+    bool IsValidMappingLocked(VAddr virtual_addr, u64 size = 0) {
+        std::shared_lock lk{mutex};
+        return IsValidMapping(virtual_addr, size);
+    }
+
+    /// True when the whole range is mapped, unlike IsValidMapping, which also accepts free or reserved areas
+    bool IsMappedLocked(VAddr virtual_addr, u64 size) {
+        std::shared_lock lk{mutex};
+        if (size == 0 || !IsValidMapping(virtual_addr, size)) {
+            return false;
+        }
+        for (auto vma = FindVMA(virtual_addr);
+             vma != vma_map.end() && vma->second.base < virtual_addr + size; ++vma) {
+            if (!vma->second.IsMapped()) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /// Reads guest memory through its physical backing, bypassing page protection. Returns false when part of
+    /// the range is unmapped or has no physical backing
+    bool TryReadBacking(VAddr virtual_addr, void* out, u64 size);
+
+    /// Return the physical run containing virtual_addr, with its guest start and size, or nullptr if absent
+    /// With try_lock, also return nullptr when a writer holds the lock; a fault handler may be that writer
+    const u8* GetBackingRun(VAddr virtual_addr, VAddr* run_start, u64* run_size,
+                            bool try_lock = false);
+
+    using StackPieces = StackRangeSet::Pieces;
+
+    /// Keep guest thread and fiber stacks writable when cpu_authoritative_stacks is enabled
+    /// The host OS cannot dispatch faults raised while pushing to a protected stack page
+    void RegisterStackRange(VAddr virtual_addr, u64 size);
+    void UnregisterStackRange(VAddr virtual_addr, u64 size);
+    bool OverlapsStackRange(VAddr virtual_addr, u64 size);
+    /// Returns the parts of [virtual_addr, virtual_addr + size) that are not stack memory
+    StackPieces SubtractStackRanges(VAddr virtual_addr, u64 size);
+    /// Returns the parts of [virtual_addr, virtual_addr + size) that are stack memory
+    StackPieces GetStackRangesIn(VAddr virtual_addr, u64 size);
+    /// Changes whenever a stack range is registered or unregistered
+    u64 StackRangesGeneration() const {
+        return stack_ranges.Generation();
+    }
+
 private:
     VMAHandle FindVMA(VAddr target) {
         return std::prev(vma_map.upper_bound(target));
@@ -317,7 +376,7 @@ private:
         return std::prev(fmem_map.upper_bound(target));
     }
 
-    bool HasPhysicalBacking(VirtualMemoryArea vma) {
+    bool HasPhysicalBacking(const VirtualMemoryArea& vma) {
         return vma.type == VMAType::Direct || vma.type == VMAType::Flexible ||
                vma.type == VMAType::Pooled;
     }
@@ -356,6 +415,15 @@ private:
     u64 pool_budget{};
     s32 sdk_version{};
     Vulkan::Rasterizer* rasterizer{};
+    StackRangeSet stack_ranges;
+    // range_fast_paths: stack queries read a per-thread merged copy of the ranges
+    // instead of the interval map under the shared lock
+    // SHADPS4_RANGE_FAST_VERIFY also runs the map query and compares
+    // Set by SetRasterizer; guest threads may already run, so the key is published last
+    std::atomic<bool> stack_copy_queries{};
+    bool stack_copy_toggle{};
+    bool stack_copy_verify{};
+    bool StackCopyOn() const;
 
     struct PrtArea {
         VAddr start;

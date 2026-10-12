@@ -1,211 +1,139 @@
-<!--
-SPDX-FileCopyrightText: 2026 shadPS4 Emulator Project
-SPDX-License-Identifier: GPL-2.0-or-later
--->
+# Pink-shadPS4
 
-<h1 align="center">
-  <br>
-  <a href="https://shadps4.net/"><img src="https://github.com/shadps4-emu/shadPS4/blob/main/.github/shadps4.png" width="220"></a>
-  <br>
-  <b>shadPS4</b>
-  <br>
-</h1>
+A fork of shadPS4 focused on fixes specific to Shadow of the Colossus, including experimental fixes and improvements. Some changes may help other games or cause regressions.
+The focus is Windows with NVIDIA graphics cards. I do not have the means to test other systems or AMD hardware, and some changes are specific to NVIDIA.
 
-<h1 align="center">
- <a href="https://discord.gg/bFJxfftGW6">
-        <img src="https://img.shields.io/discord/1080089157554155590?color=5865F2&label=shadPS4%20Discord&logo=Discord&logoColor=white" width="275">
- <a href="https://github.com/shadps4-emu/shadPS4/releases/latest">
-        <img src="https://img.shields.io/github/downloads/shadps4-emu/shadPS4/total.svg" width="140">
- <a href="https://shadps4.net/">
-        <img src="https://img.shields.io/badge/shadPS4-website-8A2BE2" width="150">
- <a href="https://x.com/shadps4">
-        <img src="https://img.shields.io/badge/-Join%20us-black?logo=X&logoColor=white" width="100">
- <a href="https://github.com/shadps4-emu/shadPS4/stargazers">
-        <img src="https://img.shields.io/github/stars/shadps4-emu/shadPS4" width="120">
-</h1>
+# DOWNLOAD
 
-|               Bloodborne by From Software                   |                     Hatsune Miku Project DIVA Future Tone by SEGA                         |
-| :-----------------------------------------------------------: | :--------------------------------------------------------------------------------------------: |
-| ![Bloodborne screenshot](./documents/Screenshots/1.png) | ![Project DIVA screenshot](./documents/Screenshots/2.png) |
+[![Download latest release](https://img.shields.io/badge/Download-Latest%20Release-pink?style=for-the-badge)](https://github.com/luizgustavs/Pink-shadPS4/releases/download/0.4.0/Pink-shardPS4.0.4.0.zip)
 
-|                  Yakuza 0 by SEGA                     |                 DRIVECLUB™ by Evolution Studios                    |
-| :------------------------------------------------------------------------: | :------------------------------------------------------------------: |
-| ![Yakuza screenshot](./documents/Screenshots/3.png) | ![DRIVECLUB screenshot](./documents/Screenshots/4.png) |
+[Download Pink-shardPS4 0.4.0 ZIP](https://github.com/luizgustavs/Pink-shadPS4/releases/download/0.4.0/Pink-shardPS4.0.4.0.zip)
 
-# General information
+The ZIP already includes the launcher and emulator with specific settings for the game. Use the launcher included in this version; other launchers won't enable the required workarounds.
 
-**shadPS4** is an early **PlayStation 4** emulator for **Windows**, **Linux** and **macOS** written in C++.
+## Quick start
 
-> [!IMPORTANT]
-> This is the emulator core, which does not include a GUI. If you just want to use the emulator as an end user, download the [**QtLauncher**](https://github.com/shadps4-emu/shadps4-qtlauncher/releases) instead.
+1. Download the ZIP and extract it into a folder.
+2. Run the launcher once to create the `games` folder, then put your game folder (`CUSAXXXXX`) inside it.
+3. Play! The launcher should apply every setting for and and automatically import the correct shadPS4.exe for you 
+4. About the audio, you need to install the PS4 libs on user/sys_modules
 
-If you encounter problems or have doubts, do not hesitate to look at the [**Quickstart**](https://github.com/shadps4-emu/shadPS4/wiki/I.-Quick-start-%5BUsers%5D).\
-To verify that a game works, you can look at [**shadPS4 Game Compatibility**](https://github.com/shadps4-compatibility/shadps4-game-compatibility).\
-To discuss shadPS4 development, suggest ideas or to ask for help, join our [**Discord server**](https://discord.gg/bFJxfftGW6).\
-To get the latest news, go to our [**X (Twitter)**](https://x.com/shadps4) or our [**website**](https://shadps4.net/).\
-You can donate to the project via our [**Kofi page**](https://ko-fi.com/shadps4).
+### Recommended settings
 
-# Status
+#### NVIDIA and AMD
 
-> [!IMPORTANT]
-> shadPS4 is early in development, don't expect a flawless experience.
+- **Workarounds > Command recording cuts:** turn this on for some extra FPS. It may cause occasional hiccups or rare graphical glitches, so turn it off for a more stable experience.
+- **General > Additional DMMem allocation:** `512 MB` may help. If your system is memory-constrained, leave it at `0`.
 
-Currently, the emulator can successfully run games like [**Bloodborne**](https://www.youtube.com/watch?v=5sZgWyVflFM), [**Dark Souls Remastered**](https://www.youtube.com/watch?v=-3PA-Xwszts), [**Red Dead Redemption**](https://www.youtube.com/watch?v=Al7yz_5nLag), and many other games.
+#### Additional AMD settings
 
-# Why
+AMD users may get a better experience with the following workaround settings:
 
-This project began for fun. Given our limited free time, it may take some time before shadPS4 can run more complex games, but we're committed to making small, regular updates.
+- **Periodic flush (commands):** set to `0`.
+- **Readback ahead on the copy engine:** uncheck.
+- **GPU wait spin:** set to `0`.
+- **GPU overhead cuts:** uncheck.
 
-# Building
+## Known issues
 
-## Docker
+1. Many issues remain; this fork is still experimental.
+2. VRAM usage is very high. It is unclear whether playing with less than 12 GB of VRAM is viable.
+3. Some textures occasionally fail to load. Restarting the game usually fixes this.
+4. Stability on AMD graphics cards is currently uncertain.
+5. Some level-of-detail (LOD) issues remain.
 
-For building shadPS4 in a containerized environment using Docker and VSCode, check the instructions here:  
-[**Docker Build Instructions**](https://github.com/shadps4-emu/shadPS4/blob/main/documents/building-docker.md)
+## Technical stuff (Workaround keys)
 
-## Windows
+Workarounds can improve specific games but may reduce performance or cause regressions elsewhere. Configure them in the launcher's **Workarounds** tab or in a per-game preset.
 
-Check the build instructions for [**Windows**](https://github.com/shadps4-emu/shadPS4/blob/main/documents/building-windows.md).
+### General
 
-## Linux
+| Key | Description |
+| --- | --- |
+| `extra_fmem_in_mbytes` | Adds flexible memory for games that run out of it. |
+| `redirect_app0_logs` | Redirects `/app0/logs` to a writable per-game log folder. |
+| `cpu_affinity_mask` | On Windows, pins the emulator to the selected logical CPUs; `0` disables it. |
+| `poll_connected_pads_only` | Polls the keyboard and connected controllers at 125 Hz to reduce input-thread CPU use. |
 
-Check the build instructions for [**Linux**](https://github.com/shadps4-emu/shadPS4/blob/main/documents/building-linux.md).
+### GPU
 
-## macOS
+| Key | Description |
+| --- | --- |
+| `compute_loop_cap` | Stops runaway compute shader loops after this many iterations; `0` disables the limit. |
+| `preserve_split_protection` | On Windows, restores GPU memory protections lost when a mapped placeholder is split. |
+| `cpu_authoritative_stacks` | Keeps guest thread and fiber stacks writable and owned by the CPU. |
+| `bpe_heap_guard_address` | Protects SotC's BPE heap metadata from GPU readbacks; `0` disables the guard. |
+| `lds_barrier_uniform_readlane` | Preserves shared-memory barriers in uniform `ReadLane` branches to fix lighting stripes. |
+| `early_fragment_tests_from_z_order` | Runs depth and stencil tests before eligible storage-writing pixel shaders. |
+| `lod_stats_from_bindings` | Derives texture LOD statistics from bound textures so higher-resolution mipmaps can load. |
+| `dynamic_tsharp_array_size` | Sets the descriptor-array size for dynamically indexed texture tables; `0` disables it. |
+| `wave64_uniform_branches` | Correctly lowers wave64 lane operations inside workgroup-uniform branches. |
+| `wave64_missing_lane_identity` | Supplies PS4 reduction identity values for wave64 lanes missing on the host GPU. |
+| `gpu_checkpoints` | Records GPU commands and submits to help diagnose device loss, at a performance cost. |
+| `srt_walker_clean_reads` | Reads clean shader-resource-table data from guest memory without draining the GPU. |
+| `shader_code_clean_reads` | Checks clean shader code through guest memory to avoid unnecessary GPU readbacks. |
+| `readback_ahead` | Submits safe GPU readbacks ahead of the current command buffer to reduce waiting. |
+| `periodic_flush_commands` | Submits after this many draws or dispatches without waiting; `0` disables it. |
+| `readback_ahead_transfer_queue` | Runs readback-ahead copies on a transfer-only queue when available. |
+| `wait_spin_us` | Polls GPU waits for this many microseconds before sleeping; `0` disables spinning. |
+| `dma_sweep_skip_stacks` | Excludes guest stacks from bulk DMA synchronization; requires `cpu_authoritative_stacks`. |
+| `gpu_overhead_cuts` | Detiles uploaded textures in VRAM and skips redundant pipeline bindings. |
+| `cp_recording_cuts` | Caches memory lookups, but may cause visual glitches. The DMA sync skip moved to `dma_sync_once_per_batch`. |
 
-Check the build instructions for [**macOS**](https://github.com/shadps4-emu/shadPS4/blob/main/documents/building-macos.md).
+#### GPU keys added in 0.3.0
 
-> [!IMPORTANT]
-> macOS users need at least macOS 26.0 to run shadPS4. Intel Macs are not supported.
+These defaults are from the emulator; per-game presets may override them.
 
-# Usage examples
+| Key | Default | Description |
+| --- | --- | --- |
+| `mapped_page_table` | `false` | Answers GPU memory lookups from a table of mapped 16 KB pages to avoid locked searches. |
+| `dma_sync_once_per_batch` | `false` | Adds resident buffer ranges to a DMA sync batch only once instead of on every DMA dispatch. This replaces the DMA sync skip previously included in `cp_recording_cuts`. |
+| `incremental_bind` | `false` | Reuses unchanged read-only buffer and texture bindings from the previous call of a pipeline while their resources remain valid. |
+| `tsharp_cache` | `false` | Reuses texture descriptor lookups across pipelines while the registered images on their pages remain unchanged; changes what the GPU samples, so check visually. |
+| `wait_marker` | `0` | `0` disables it; `1` polls a GPU-written marker before querying the driver; `2` also lets readbacks complete on that marker. Requires `wait_spin_us` greater than `0`. |
+| `image_memory_pool` | `false` | Sub-allocates images up to 16 MB from pools with 32 MB blocks instead of allocating memory separately for each image. |
+| `cp_record_thread` | `false` | Moves Vulkan command recording and submissions to a separate worker thread; pairs with `readback_ahead_transfer_queue`. |
+| `lds_barriers_large_groups` | `true` | Adds shared-memory barriers to compute workgroups larger than 64 threads to fix the blown-out sun on NVIDIA. |
+| `eop_label_delay_us` | `0` | Temporary workaround for SotC's flickering rocks: delays graphics EOP labels by a fixed number of microseconds (`2000` was used in testing); `0` disables it. This does not guarantee GPU completion, and enabling `readback_ahead` can bring the flicker back. |
 
-> [!IMPORTANT]
-> For a user-friendly GUI, download the [**QtLauncher**](https://github.com/shadps4-emu/shadps4-qtlauncher/releases).
+### Other settings used by the SotC presets
 
-To get the list of all available commands and also a more detailed description of what each command does, please refer to the `--help` flag's output.
+These are regular emulator settings stored alongside the workarounds in the shipped presets.
 
-Below is a list of commonly used command patterns:
-```sh
-shadPS4 CUSA00001 # Searches for a game folder called CUSA00001 in the list of game install folders, and boots it.
-shadPS4 --fullscreen true --config-clean CUSA00001    # the game argument is always the last one,
-shadPS4 -g CUSA00001 --fullscreen true --config-clean # ...unless manually specified otherwise.
-shadPS4 /path/to/game.elf # Boots a PS4 ELF file directly. Useful if you want to boot an executable that is not named eboot.bin.
-shadPS4 CUSA00001 -- -flag1 -flag2 # Passes '-flag1' and '-flag2' to the game executable in argv.
-```
+| Key | Description |
+| --- | --- |
+| `extra_dmem_in_mbytes` | Adds direct memory for games that need a larger allocation pool. |
+| `filter` | Selects which log categories and severity levels are recorded. |
+| `direct_memory_access_enabled` | Allows direct access to guest memory from the GPU path. |
+| `readbacks_mode` | Selects the GPU readback accuracy mode; the SotC preset uses precise mode (`2`). |
+| `pipeline_cache_enabled` | Reuses cached Vulkan pipelines to reduce shader compilation stutter. |
+| `windows_guest_red_zone_protection_mode` | Selects the Windows guest red-zone protection strategy. |
 
-# Debugging and reporting issues
+### Shader cache
 
-For more information on how to test, debug and report issues with the emulator or games, read the [**Debugging documentation**](https://github.com/shadps4-emu/shadPS4/blob/main/documents/Debugging/Debugging.md).
+If a game shows a burst of rejected textures, thousands of new shader permutations or a device loss right
+after boot, the shader cache may have been corrupted by an older build (a new permutation could overwrite
+another one on disk). Delete the whole `user/cache/<serial>` folder (or `<serial>.zip`) and let it rebuild.
 
-# Keyboard and Mouse Mappings
+### Shadow of the Colossus engine settings
 
-> [!NOTE]
-> Some keyboards may also require you to hold the Fn key to use the F\* keys. Mac users should use the Command key instead of Control, and need to use Command+F11 for full screen to avoid conflicting with system key bindings.
+Not an emulator setting: adding both `+doIndexBufferCulling=0` and `+doSunShadowIndexBufferCulling=0` to
+`games/<serial>/CommandLineArgs.txt` raised the sanctuary from ~22 to ~28 fps in testing, with the same image.
+Always use the two together; one without the other gives wrong geometry or a device loss.
 
-| Button | Function |
-|-------------|-------------|
-F10 | FPS Counter
-Ctrl+F10 | Video Debug Info
-F11 | Fullscreen
-F12 | Trigger RenderDoc Capture (or game-only screenshot if RenderDoc is unavailable)
-Alt+F12 | Capture screenshot including HUD/dialog overlays
+### Audio
 
-> [!NOTE]
-> Xbox and DualShock controllers work out of the box.
+| Key | Description |
+| --- | --- |
+| `audio_follow_game_speed` | Slows audio with the game to avoid crackling below the target frame rate. |
+| `audio_min_game_speed` | Sets the minimum audio playback speed as a percentage. |
+| `audio_game_target_fps` | Sets the frame rate considered full speed; `0` uses the game's flip rate. |
 
-| Controller button | Keyboard equivalent |
-|-------------|-------------|
-LEFT AXIS UP | W |
-LEFT AXIS DOWN | S |
-LEFT AXIS LEFT | A |
-LEFT AXIS RIGHT | D |
-RIGHT AXIS UP | I |
-RIGHT AXIS DOWN | K |
-RIGHT AXIS LEFT | J |
-RIGHT AXIS RIGHT | L |
-TRIANGLE | Numpad 8 or C |
-CIRCLE | Numpad 6 or B |
-CROSS | Numpad 2 or N |
-SQUARE | Numpad 4 or V |
-PAD UP | UP |
-PAD DOWN | DOWN |
-PAD LEFT | LEFT |
-PAD RIGHT | RIGHT |
-OPTIONS | RETURN |
-BACK BUTTON / TOUCH PAD | SPACE |
-L1 | Q |
-R1 | U |
-L2 | E |
-R2 | O |
-L3 | X |
-R3 | M |
+## Original repositories
 
-Keyboard and mouse inputs can be customized in the settings menu by clicking the Controller button, and further details and help on controls are  also found there. Custom bindings are saved per-game. Inputs support up to three keys per binding, mouse buttons, mouse movement mapped to joystick input, and more.
+- [shadPS4](https://github.com/shadps4-emu/shadPS4)
+- [shadPS4 QtLauncher](https://github.com/shadps4-emu/shadps4-qtlauncher)
 
+## License
 
-# Firmware files
-
-shadPS4 can load some PlayStation 4 firmware files.
-The following firmware modules are supported and must be placed in shadPS4's `sys_modules` folder.
-
-<div align="center">
-
-| Modules                        | Modules                        | Modules                        | Modules                        |
-|--------------------------------|--------------------------------|--------------------------------|--------------------------------|
-| libSceAt9Enc.sprx              | libSceAudiodec.sprx            | libSceAudiodecCpu.sprx         | libSceAudiodecCpuDdp.sprx      |
-| libSceAudiodecCpuDtsHdLbr.sprx | libSceAudiodecCpuHevag.sprx    | libSceAudiodecCpuM4aac.sprx    | libSceAvPlayer.sprx            |
-| libSceAvPlayerStreaming.sprx   | libSceBeisobmf.sprx            | libSceBemp2sys.sprx            | libSceCesCs.sprx               |
-| libSceFont.sprx                | libSceFontFt.sprx              | libSceFreeTypeOl.sprx          | libSceFreeTypeOptOl.sprx       |
-| libSceFreeTypeOt.sprx          | libSceJpegDec.sprx             | libSceJpegEnc.sprx             | libSceJson.sprx                |
-| libSceJson2.sprx               | libSceLibcInternal.sprx        | libSceNgs2.sprx                | libScePngEnc.sprx              |
-| libScePsmKitSystem.sprx        | libSceRtc.sprx                 | libSceRudp.sprx                | libSceSystemGesture.sprx       |
-| libSceUlt.sprx                 | libSceWkFontConfig.sprx        | libSceXml.sprx                 | libSceDepth.sprx               |
-| libScePadTracker.sprx          | libSceMoveTracker.sprx         |
-</div>
-
-> [!Caution]
-> The above modules are required to run the games properly and must be dumped from your legally owned PlayStation 4 console.
-
-
-
-# Main team
-
-- [**georgemoralis**](https://github.com/georgemoralis)
-- [**psucien**](https://github.com/psucien)
-- [**viniciuslrangel**](https://github.com/viniciuslrangel)
-- [**roamic**](https://github.com/roamic)
-- [**squidbus**](https://github.com/squidbus)
-- [**frodo**](https://github.com/baggins183)
-- [**Stephen Miller**](https://github.com/StevenMiller123)
-- [**kalaposfos13**](https://github.com/kalaposfos13)
-
-Logo is done by [**Xphalnos**](https://github.com/Xphalnos)
-
-<a href="https://github.com/shadps4-emu/shadPS4/graphs/contributors">
-  <img src="https://contrib.rocks/image?repo=shadps4-emu/shadPS4&max=24">
-</a>
-
-# Contributing
-
-If you want to contribute, please read the [**CONTRIBUTING.md**](https://github.com/shadps4-emu/shadPS4/blob/main/CONTRIBUTING.md) file.\
-Open a PR and we'll check it :)
-
-
-# Special Thanks
-
-A few noteworthy teams/projects who've helped us along the way are:
-
-- [**Panda3DS**](https://github.com/wheremyfoodat/Panda3DS): A multiplatform 3DS emulator from our co-author wheremyfoodat. They have been incredibly helpful in understanding and solving problems that came up from natively executing the x64 code of PS4 binaries
-
-- [**fpPS4**](https://github.com/red-prig/fpPS4): The fpPS4 team has assisted massively with understanding some of the more complex parts of the PS4 operating system and libraries, by helping with reverse engineering work and research.
-
-- **yuzu**: Our shader compiler has been designed with yuzu's Hades compiler as a blueprint. This allowed us to focus on the challenges of emulating a modern AMD GPU while having a high-quality optimizing shader compiler implementation as a base.
-
-- [**felix86**](https://github.com/OFFTKP/felix86): A new x86-64 → RISC-V Linux userspace emulator
-
-- [**emudev.org**](https://emudev.org/): A network of people interested in the documentation, emulation, simulation and re-implementation of hardware near extinction . Belongs to my friend skmp and me (shadow) also a member of it
-
-# License
-
-- [**GPL-2.0 license**](https://github.com/shadps4-emu/shadPS4/blob/main/LICENSE)
+GPL-2.0, as both upstream projects.

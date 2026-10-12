@@ -3,10 +3,23 @@
 
 #include <boost/preprocessor/stringize.hpp>
 
+#include <chrono>
+#include <condition_variable>
+#include <deque>
+#include <mutex>
+#include <optional>
+#include <thread>
+#include <unordered_map>
+
 #include "common/assert.h"
+#include "common/cp_profiler.h"
 #include "common/debug.h"
+#include "common/guest_write_journal.h"
+#include "common/logging/events.h"
+#include "common/perf_stats.h"
 #include "common/polyfill_thread.h"
 #include "common/thread.h"
+#include "common/unique_function.h"
 #include "core/debug_state.h"
 #include "core/emulator_settings.h"
 #include "core/libraries/kernel/process.h"
@@ -16,9 +29,275 @@
 #include "video_core/amdgpu/liverpool.h"
 #include "video_core/amdgpu/pm4_cmds.h"
 #include "video_core/renderdoc.h"
+#include "video_core/renderer_vulkan/vk_draw_trace.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 
 namespace AmdGpu {
+
+/// IT_COND_EXEC: true when the packets that follow must be skipped. The condition address comes from the
+/// command buffer; a garbage one must not crash the host, so the packets then execute, like a condition that
+/// always passes
+static bool CondExecSkips(const PM4CmdCondExec* cond_exec, const char* queue) {
+    if (cond_exec->command.Value() != 0) {
+        LOG_WARNING(Render, "IT_COND_EXEC used a reserved command ({})", queue);
+    }
+    const bool* cond_addr = cond_exec->Address();
+    if (!Core::Memory::Instance()->IsMappedLocked(reinterpret_cast<VAddr>(cond_addr),
+                                                  sizeof(bool))) {
+        LOG_WARNING(Render, "IT_COND_EXEC with unmapped address {:#x}, executing ({})",
+                    reinterpret_cast<VAddr>(cond_addr), queue);
+        return false;
+    }
+    return *cond_addr == false;
+}
+
+/// SHADPS4_DRAW_TRACE: the synchronization packets of the traced frames, with their queue, so a trace shows
+/// what each dispatch waited for (or did not wait for) before it ran. The next step on the SotC TDR root
+/// cause (§17 of the port guide) is a dispatch that runs before the game wrote its constant buffer
+static bool TraceSync() {
+    return Vulkan::DrawTrace::Instance().Active();
+}
+
+template <typename... Args>
+static void LogSync(std::string_view queue, fmt::format_string<Args...> format, Args&&... args) {
+    LOG_WARNING(Render, "DrawTrace f={} {} {}", Vulkan::DrawTrace::Instance().Frame(), queue,
+                fmt::format(format, std::forward<Args>(args)...));
+}
+
+/// Delay gfx EOP labels with a timer as a temporary workaround for the SotC rock flicker
+/// The game starts CPU visibility jobs after reading the previous BOTTOM_OF_PIPE label for their
+/// memory
+/// Writing that label as soon as the packet is read can release the jobs too early and put their
+/// output in another frame
+/// The timer adds a fixed delay without waiting for the GPU or submitting work, and 2000 us helped
+/// in earlier tests
+/// It can still publish the label too early when the GPU falls behind, and readback_ahead can bring
+/// the flicker back
+/// A complete fix still needs to publish labels after the GPU finishes the commands before them
+/// Treat the delay as a timing adjustment rather than proof that the preceding work has completed,
+/// because the timer cannot see how far the GPU has progressed
+namespace DelayedLabels {
+namespace {
+struct Pending {
+    u64 value;
+    u32 bytes;
+    u64 seq;
+};
+std::mutex pending_mutex;
+std::unordered_map<VAddr, Pending> pending;
+u64 next_seq{};
+std::atomic<u32> pending_count{};
+
+struct Item {
+    u64 due_ns;
+    Common::UniqueFunction<void> func;
+};
+/// Keep this timer state alive until process exit because the detached worker may still be waiting
+/// on it during static destruction
+struct TimerState {
+    std::mutex mutex;
+    std::condition_variable cv;
+    std::deque<Item> items;
+};
+TimerState& Timer() {
+    static auto* const state = new TimerState;
+    return *state;
+}
+
+u64 NowNs() {
+    return static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                std::chrono::steady_clock::now().time_since_epoch())
+                                .count());
+}
+
+void Worker() {
+    Common::SetCurrentThreadName("shadPS4:LabelTimer");
+    auto& [timer_mutex, timer_cv, items] = Timer();
+    std::unique_lock lk{timer_mutex};
+    while (true) {
+        timer_cv.wait(lk, [&] { return !items.empty(); });
+        const u64 due = items.front().due_ns;
+        const u64 now = NowNs();
+        if (now < due) {
+            // The OS timer has roughly 1 ms resolution, so sleep for most of the remaining delay
+            // and yield near the deadline
+            if (due - now > 1'500'000) {
+                timer_cv.wait_for(lk, std::chrono::nanoseconds{due - now - 1'000'000});
+            } else {
+                lk.unlock();
+                std::this_thread::yield();
+                lk.lock();
+            }
+            continue;
+        }
+        // Every label uses the same delay and enters in command order, so the front of the queue is
+        // also the next label due
+        auto func = std::move(items.front().func);
+        items.pop_front();
+        lk.unlock();
+        func();
+        lk.lock();
+    }
+}
+} // Anonymous namespace
+
+/// Return the configured EOP label delay in microseconds, or 0 when the temporary timing workaround
+/// is disabled
+u32 DelayUs() {
+    static const u32 delay_us = [] {
+        const u32 value = EmulatorSettings.GetEopLabelDelayUs();
+        if (value != 0) {
+            LOG_WARNING(Render, "Workaround eop_label_delay_us enabled: gfx EOP labels {} us after "
+                                "the packet (crude timing patch)",
+                        value);
+            if (EmulatorSettings.IsReadbackAhead()) {
+                LOG_WARNING(Render, "eop_label_delay_us with readback_ahead: the flicker it hides "
+                                    "comes back with readback_ahead");
+            }
+        }
+        return value;
+    }();
+    return delay_us;
+}
+
+/// Keep the label waiting for its timer together with the value that command processor waits should
+/// already see
+u64 AddPending(VAddr addr, u64 value, u32 bytes) {
+    std::scoped_lock lock{pending_mutex};
+    pending[addr] = Pending{value, bytes, ++next_seq};
+    pending_count.store(static_cast<u32>(pending.size()), std::memory_order_release);
+    return next_seq;
+}
+
+void RemovePending(VAddr addr, u64 seq) {
+    std::scoped_lock lock{pending_mutex};
+    const auto it = pending.find(addr);
+    if (it != pending.end() && it->second.seq == seq) {
+        pending.erase(it);
+        pending_count.store(static_cast<u32>(pending.size()), std::memory_order_release);
+    }
+}
+
+std::optional<u32> PendingDword(VAddr addr) {
+    if (pending_count.load(std::memory_order_acquire) == 0) {
+        return std::nullopt;
+    }
+    std::scoped_lock lock{pending_mutex};
+    if (const auto it = pending.find(addr); it != pending.end()) {
+        return static_cast<u32>(it->second.value);
+    }
+    if (const auto it = pending.find(addr - 4); it != pending.end() && it->second.bytes == 8) {
+        return static_cast<u32>(it->second.value >> 32);
+    }
+    return std::nullopt;
+}
+
+void Push(u64 delay_ns, Common::UniqueFunction<void>&& func) {
+    static std::once_flag started;
+    std::call_once(started, [] { std::thread{Worker}.detach(); });
+    auto& timer = Timer();
+    {
+        std::scoped_lock lk{timer.mutex};
+        timer.items.push_back(Item{NowNs() + delay_ns, std::move(func)});
+    }
+    timer.cv.notify_one();
+}
+} // namespace DelayedLabels
+
+/// Check WAIT_REG_MEM using the value visible to the command processor in command order
+/// With eop_label_delay_us, a pending label already has its queued value for these waits even
+/// before the timer writes guest memory
+static bool CpWaitPasses(const PM4CmdWaitRegMem* wait, std::span<const u32> regs) {
+    if (DelayedLabels::DelayUs() != 0 &&
+        wait->mem_space.Value() == PM4CmdWaitRegMem::MemSpace::Memory) {
+        if (const auto value = DelayedLabels::PendingDword(wait->Address<VAddr>())) {
+            return wait->TestValue(*value);
+        }
+    }
+    return wait->Test(regs);
+}
+
+namespace CpHistory {
+
+namespace {
+struct Entry {
+    u64 ns;
+    const void* header; // packet header, or the first dword of a submit
+    std::array<u32, 4> words;
+    u32 size_dw; // submits only
+    s16 queue;
+    u16 opcode; // SubmitOpcode for a submit
+};
+constexpr u16 SubmitOpcode = 0xFFFF;
+constexpr u32 NumEntries = 1024;
+std::array<Entry, NumEntries> entries{};
+std::atomic<u64> next_entry{0};
+
+u64 NowNs() {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+               std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+}
+
+std::string QueueName(s16 queue) {
+    return queue == Queue::Ce ? "CE" : queue == Queue::De ? "DE" : fmt::format("ASC{}", queue);
+}
+} // Anonymous namespace
+
+const bool enabled = [] {
+    const char* value = std::getenv("SHADPS4_CBUF_PROBE");
+    return value && *value && std::string_view{value} != "0";
+}();
+
+void RecordPacket(s16 queue, std::span<const u32> packet) {
+    // Packets come from the command processor thread only; submits race with it, which is fine for
+    // a diagnostic (a torn entry shows up as garbage in the dump)
+    auto& entry = entries[next_entry.fetch_add(1, std::memory_order_relaxed) % NumEntries];
+    const auto* pm4 = reinterpret_cast<const PM4Header*>(packet.data());
+    const u32* body = packet.data() + 1;
+    // Keep truncated packets inside the submission
+    const u32 count = std::min<u32>({pm4->type3.NumWords(), static_cast<u32>(packet.size() - 1), 4});
+    entry.ns = NowNs();
+    entry.header = packet.data();
+    entry.words = {};
+    std::memcpy(entry.words.data(), body, count * sizeof(u32));
+    entry.size_dw = 0;
+    entry.queue = queue;
+    entry.opcode = static_cast<u16>(pm4->type3.opcode.Value());
+}
+
+void RecordSubmit(s16 queue, std::span<const u32> commands) {
+    auto& entry = entries[next_entry.fetch_add(1, std::memory_order_relaxed) % NumEntries];
+    entry.ns = NowNs();
+    entry.header = commands.data();
+    entry.words = {};
+    entry.size_dw = static_cast<u32>(commands.size());
+    entry.queue = queue;
+    entry.opcode = SubmitOpcode;
+}
+
+void Dump(u32 count) {
+    const u64 end = next_entry.load(std::memory_order_relaxed);
+    const u64 begin = end - std::min<u64>({end, count, NumEntries});
+    const u64 now = NowNs();
+    for (u64 i = begin; i < end; ++i) {
+        const Entry entry = entries[i % NumEntries];
+        const double ago_ms = static_cast<double>(now - entry.ns) / 1e6;
+        if (entry.opcode == SubmitOpcode) {
+            LOG_WARNING(Render, "CbufProbe hist -{:.3f}ms {} SUBMIT {} dwords at {}", ago_ms,
+                        QueueName(entry.queue), entry.size_dw, entry.header);
+            continue;
+        }
+        const auto opcode = static_cast<PM4ItOpcode>(entry.opcode);
+        // enum_name is empty above 127 (the CE opcodes), so the raw opcode goes along
+        LOG_WARNING(Render,
+                    "CbufProbe hist -{:.3f}ms {} {}({:#04x}) at {} [{:08x} {:08x} {:08x} {:08x}]",
+                    ago_ms, QueueName(entry.queue), magic_enum::enum_name(opcode), entry.opcode,
+                    entry.header, entry.words[0], entry.words[1], entry.words[2], entry.words[3]);
+    }
+}
+
+} // namespace CpHistory
 
 static const char* dcb_task_name{"DCB_TASK"};
 static const char* ccb_task_name{"CCB_TASK"};
@@ -95,6 +374,8 @@ void Liverpool::Process(std::stop_token stoken) {
 #ifdef __linux__
     gpu_tid = gettid();
 #endif
+    Common::PerfStats::MarkGpuThread();
+    Common::CpProfiler::RegisterCurrentThread();
 
     while (!stoken.stop_requested()) {
         {
@@ -105,6 +386,9 @@ void Liverpool::Process(std::stop_token stoken) {
         if (stoken.stop_requested()) {
             break;
         }
+        const bool perf = Common::PerfStats::Enabled();
+        const auto busy_start =
+            perf ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
 
         VideoCore::StartCapture();
 
@@ -132,6 +416,9 @@ void Liverpool::Process(std::stop_token stoken) {
 
                 std::scoped_lock lock{queue.m_access};
                 queue.submits.pop();
+                if (!queue.submit_times.empty()) {
+                    queue.submit_times.pop();
+                }
 
                 --num_submits;
                 std::scoped_lock lock2{submit_mutex};
@@ -146,6 +433,12 @@ void Liverpool::Process(std::stop_token stoken) {
                 rasterizer->Flush();
             }
             submit_done = false;
+        }
+        if (perf) {
+            Common::PerfStats::Add(Common::PerfStats::Id::CpBusyNs,
+                                   std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                       std::chrono::steady_clock::now() - busy_start)
+                                       .count());
         }
 
         Platform::IrqC::Instance()->Signal(Platform::InterruptId::GpuIdle);
@@ -167,6 +460,9 @@ Liverpool::Task Liverpool::ProcessCeUpdate(std::span<const u32> ccb) {
 
         const PM4ItOpcode opcode = header->type3.opcode;
         const auto* it_body = reinterpret_cast<const u32*>(header) + 1;
+        if (CpHistory::Enabled()) {
+            CpHistory::RecordPacket(CpHistory::Queue::Ce, ccb);
+        }
         switch (opcode) {
         case PM4ItOpcode::Nop: {
             // const auto* nop = reinterpret_cast<const PM4CmdNop*>(header);
@@ -187,6 +483,9 @@ Liverpool::Task Liverpool::ProcessCeUpdate(std::span<const u32> ccb) {
                     buffer_cache.FlushSyncBatch();
                 }
             }
+            Common::GuestWriteJournal::Record(Common::GuestWriteJournal::Source::DumpConstRam,
+                                              dump_const->Address<VAddr>(), size,
+                                              cblock.constants_heap.data() + dump_const->Offset());
             memcpy(dump_const->Address<void*>(),
                    cblock.constants_heap.data() + dump_const->Offset(), size);
             break;
@@ -211,6 +510,19 @@ Liverpool::Task Liverpool::ProcessCeUpdate(std::span<const u32> ccb) {
             while (!task.handle.done()) {
                 YIELD_CE();
                 RESUME_CE(task);
+            }
+            break;
+        }
+        case PM4ItOpcode::PredExec: {
+            // Executed unconditionally, like a predicate that always passes (as in the DE)
+            LOG_DEBUG(Render, "IT_PRED_EXEC ignored (CE)");
+            break;
+        }
+        case PM4ItOpcode::CondExec: {
+            const auto* cond_exec = reinterpret_cast<const PM4CmdCondExec*>(header);
+            if (CondExecSkips(cond_exec, "CE")) {
+                ccb = NextPacket(ccb, header->type3.NumWords() + 1 + cond_exec->exec_count.Value());
+                continue;
             }
             break;
         }
@@ -243,6 +555,9 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
     const auto base_addr = reinterpret_cast<uintptr_t>(dcb.data());
     while (!dcb.empty()) {
         ProcessCommands();
+        if (rasterizer) {
+            rasterizer->SetCommandRing(0);
+        }
 
         const auto* header = reinterpret_cast<const PM4Header*>(dcb.data());
         const u32 type = header->type;
@@ -262,6 +577,9 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
         case 3:
             const u32 count = header->type3.NumWords();
             const PM4ItOpcode opcode = header->type3.opcode;
+            if (CpHistory::Enabled()) {
+                CpHistory::RecordPacket(CpHistory::Queue::De, dcb);
+            }
             switch (opcode) {
             case PM4ItOpcode::Nop: {
                 const auto* nop = reinterpret_cast<const PM4CmdNop*>(header);
@@ -417,7 +735,23 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 break;
             }
             case PM4ItOpcode::SetPredication: {
-                LOG_WARNING(Render, "Unimplemented IT_SET_PREDICATION");
+                // The packet stores START_ADDR_LO followed by START_ADDR_HI[7:0],
+                // PREDICATION_BOOL[8] and HINT[12]
+                // PRED_OP[18:16] selects clear, ZPass or PrimCount, and CONTINUE[31] carries the
+                // continuation flag
+                // SotC only sends the clear operation here, about 15 times per frame, which needs
+                // no work while predication is never enabled
+                const auto* body = reinterpret_cast<const u32*>(header) + 1;
+                const u32 lo = count >= 1 ? body[0] : 0;
+                const u32 ctl = count >= 2 ? body[1] : 0;
+                if (((ctl >> 16) & 7) == 0) {
+                    break;
+                }
+                LOG_RENDER_PROBLEM(Render, Warning,
+                                   "Unimplemented IT_SET_PREDICATION op={} bool={} hint={} "
+                                   "continue={} addr={:#x}",
+                                   (ctl >> 16) & 7, (ctl >> 8) & 1, (ctl >> 12) & 1, ctl >> 31,
+                                   (u64{ctl & 0xff} << 32) | (lo & ~0xfu));
                 break;
             }
             case PM4ItOpcode::IndexType: {
@@ -640,9 +974,17 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
             }
             case PM4ItOpcode::EventWrite: {
                 const auto* event = reinterpret_cast<const PM4CmdEventWrite*>(header);
+                if (rasterizer) {
+                    rasterizer->OnGameSync();
+                }
                 LOG_DEBUG(Render, "Encountered EventWrite: event_type = {}, event_index = {}",
                           magic_enum::enum_name(event->event_type.Value()),
                           magic_enum::enum_name(event->event_index.Value()));
+                if (TraceSync()) {
+                    LogSync("DE", "EVENT_WRITE type={} index={}",
+                            magic_enum::enum_name(event->event_type.Value()),
+                            magic_enum::enum_name(event->event_index.Value()));
+                }
                 if (event->event_type.Value() == EventType::SoVgtStreamoutFlush) {
                     // TODO: handle proper synchronization, for now signal that update is done
                     // immediately
@@ -663,10 +1005,22 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
             case PM4ItOpcode::EventWriteEos: {
                 const auto* event_eos = reinterpret_cast<const PM4CmdEventWriteEos*>(header);
                 if (rasterizer) {
+                    rasterizer->OnGameSync();
+                }
+                if (TraceSync()) {
+                    LogSync("DE", "EVENT_WRITE_EOS type={} command={} addr={:#x} data={:#x}",
+                            event_eos->event_type.Value(), u32(event_eos->command.Value()),
+                            event_eos->Address<VAddr>(), event_eos->data);
+                }
+                if (rasterizer) {
                     rasterizer->OnFence();
                 }
+                RecordLabelLag(GfxQueueId);
                 event_eos->SignalFence([](void* address, u64 data, u32 num_bytes) {
                     auto* memory = Core::Memory::Instance();
+                    Common::GuestWriteJournal::Record(Common::GuestWriteJournal::Source::Label,
+                                                      reinterpret_cast<u64>(address), num_bytes,
+                                                      &data, 0);
                     ASSERT(memory->TryWriteBacking(address, &data, num_bytes));
                 });
                 if (event_eos->command == PM4CmdEventWriteEos::Command::GdsStore) {
@@ -682,14 +1036,67 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
             case PM4ItOpcode::EventWriteEop: {
                 const auto* event_eop = reinterpret_cast<const PM4CmdEventWriteEop*>(header);
                 if (rasterizer) {
+                    rasterizer->OnGameSync();
+                }
+                if (TraceSync()) {
+                    LogSync("DE", "EVENT_WRITE_EOP type={} data_sel={} int_sel={} addr={} data={:#x}",
+                            event_eop->event_type.Value(), u32(event_eop->data_sel.Value()),
+                            u32(event_eop->int_sel.Value()), fmt::ptr(event_eop->Address<u32>()),
+                            event_eop->data_lo);
+                }
+                if (rasterizer) {
                     rasterizer->OnFence();
                 }
-                event_eop->SignalFence(
-                    [](void* address, u64 data, u32 num_bytes) {
-                        auto* memory = Core::Memory::Instance();
-                        ASSERT(memory->TryWriteBacking(address, &data, num_bytes));
-                    },
-                    [] { Platform::IrqC::Instance()->Signal(Platform::InterruptId::GfxEop); });
+                RecordLabelLag(GfxQueueId);
+                const auto write_label = [](void* address, u64 data, u32 num_bytes) {
+                    auto* memory = Core::Memory::Instance();
+                    Common::GuestWriteJournal::Record(Common::GuestWriteJournal::Source::Label,
+                                                      reinterpret_cast<u64>(address), num_bytes,
+                                                      &data, 1);
+                    ASSERT(memory->TryWriteBacking(address, &data, num_bytes));
+                };
+                const auto signal_irq = [] {
+                    Platform::IrqC::Instance()->Signal(Platform::InterruptId::GfxEop);
+                };
+                // With eop_label_delay_us, write this gfx label and raise its interrupt after the
+                // fixed timer delay
+                // GPU timestamps and video output labels still use their normal immediate write
+                // path
+                const auto data_sel = event_eop->data_sel.Value();
+                if (const u32 delay_us = DelayedLabels::DelayUs();
+                    delay_us != 0 && data_sel != DataSelect::GpuClock64 &&
+                    data_sel != DataSelect::PerfCounter &&
+                    !vo_port->IsVoLabel(event_eop->Address<u64>())) {
+                    const PM4CmdEventWriteEop packet = *event_eop;
+                    const auto label_addr = reinterpret_cast<VAddr>(event_eop->Address<u8>());
+                    const u64 seq =
+                        data_sel == DataSelect::Data32Low
+                            ? DelayedLabels::AddPending(label_addr, packet.DataDWord(), sizeof(u32))
+                        : data_sel == DataSelect::Data64
+                            ? DelayedLabels::AddPending(label_addr, packet.DataQWord(), sizeof(u64))
+                            : 0;
+                    // The guest may have unmapped this label while the timer was waiting, so drop
+                    // the delayed write instead of aborting on an invalid address
+                    const auto write_delayed = [](void* address, u64 data, u32 num_bytes) {
+                        Common::GuestWriteJournal::Record(Common::GuestWriteJournal::Source::Label,
+                                                          reinterpret_cast<u64>(address), num_bytes,
+                                                          &data, 1);
+                        if (!Core::Memory::Instance()->TryWriteBacking(address, &data, num_bytes)) {
+                            LOG_WARNING(Render, "eop_label_delay_us: label {} unmapped before its "
+                                                "delayed write, dropped",
+                                        fmt::ptr(address));
+                        }
+                    };
+                    DelayedLabels::Push(u64{delay_us} * 1000,
+                                        [packet, write_delayed, signal_irq, label_addr, seq] {
+                                            packet.SignalFence(write_delayed, signal_irq);
+                                            if (seq != 0) {
+                                                DelayedLabels::RemovePending(label_addr, seq);
+                                            }
+                                        });
+                    break;
+                }
+                event_eop->SignalFence(write_label, signal_irq);
                 break;
             }
             case PM4ItOpcode::DmaData: {
@@ -698,6 +1105,13 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                     break;
                 }
                 ASSERT(dma_data->command.das == 0);
+                if (Vulkan::DrawTrace::Instance().Active()) {
+                    LOG_WARNING(Render, "DrawTrace f={} DMA_DATA src_sel={} dst_sel={} src={:#x} "
+                                        "dst={:#x} bytes={:#x}",
+                                Vulkan::DrawTrace::Instance().Frame(), u32(dma_data->src_sel),
+                                u32(dma_data->dst_sel), dma_data->SrcAddress<VAddr>(),
+                                dma_data->DstAddress<VAddr>(), dma_data->NumBytes());
+                }
                 if (dma_data->src_sel == DmaDataSrc::Data && dma_data->dst_sel == DmaDataDst::Gds) {
                     rasterizer->FillBuffer(dma_data->dst_addr_lo, dma_data->NumBytes(),
                                            dma_data->data, true);
@@ -734,10 +1148,18 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 ASSERT(write_data->dst_sel.Value() == 2 || write_data->dst_sel.Value() == 5);
                 const u32 data_size = (header->type3.count.Value() - 2) * 4;
                 u64* address = write_data->Address<u64*>();
+                if (Vulkan::DrawTrace::Instance().Active()) {
+                    LOG_WARNING(Render, "DrawTrace f={} WRITE_DATA dst={} bytes={:#x}",
+                                Vulkan::DrawTrace::Instance().Frame(), fmt::ptr(address),
+                                data_size);
+                }
                 if (!write_data->wr_one_addr.Value()) {
                     if (rasterizer) {
                         rasterizer->OnFence();
                     }
+                    Common::GuestWriteJournal::Record(Common::GuestWriteJournal::Source::WriteData,
+                                                      reinterpret_cast<u64>(address), data_size,
+                                                      write_data->data, 0);
                     std::memcpy(address, write_data->data, data_size);
                 } else {
                     UNREACHABLE();
@@ -746,16 +1168,24 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
             }
             case PM4ItOpcode::CopyData: {
                 const auto* copy_data = reinterpret_cast<const PM4CmdCopyData*>(header);
-                LOG_WARNING(Render,
-                            "unhandled IT_COPY_DATA src_sel = {}, dst_sel = {}, "
-                            "count_sel = {}, wr_confirm = {}, engine_sel = {}",
-                            u32(copy_data->src_sel.Value()), u32(copy_data->dst_sel.Value()),
-                            copy_data->count_sel.Value(), copy_data->wr_confirm.Value(),
-                            u32(copy_data->engine_sel.Value()));
+                LOG_RENDER_PROBLEM(Render, Warning,
+                                   "unhandled IT_COPY_DATA src_sel = {}, dst_sel = {}, "
+                                   "count_sel = {}, wr_confirm = {}, engine_sel = {}",
+                                   u32(copy_data->src_sel.Value()), u32(copy_data->dst_sel.Value()),
+                                   copy_data->count_sel.Value(), copy_data->wr_confirm.Value(),
+                                   u32(copy_data->engine_sel.Value()));
                 break;
             }
             case PM4ItOpcode::MemSemaphore: {
                 const auto* mem_semaphore = reinterpret_cast<const PM4CmdMemSemaphore*>(header);
+                if (rasterizer && !mem_semaphore->IsSignaling()) {
+                    rasterizer->OnGameSync();
+                }
+                if (TraceSync()) {
+                    LogSync("DE", "MEM_SEMAPHORE {} addr={:#x}",
+                            mem_semaphore->IsSignaling() ? "signal" : "wait",
+                            mem_semaphore->Address<VAddr>());
+                }
                 if (mem_semaphore->IsSignaling()) {
                     mem_semaphore->Signal();
                 } else {
@@ -767,7 +1197,14 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 break;
             }
             case PM4ItOpcode::AcquireMem: {
-                // const auto* acquire_mem = reinterpret_cast<PM4CmdAcquireMem*>(header);
+                const auto* acquire_mem = reinterpret_cast<const PM4CmdAcquireMem*>(header);
+                if (rasterizer) {
+                    rasterizer->OnGameSync();
+                }
+                if (TraceSync()) {
+                    LogSync("DE", "ACQUIRE_MEM cntl={:#x} base={:#x}", acquire_mem->cp_coher_cntl,
+                            acquire_mem->cp_coher_base_lo);
+                }
                 break;
             }
             case PM4ItOpcode::Rewind: {
@@ -782,18 +1219,34 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
             }
             case PM4ItOpcode::WaitRegMem: {
                 const auto* wait_reg_mem = reinterpret_cast<const PM4CmdWaitRegMem*>(header);
+                if (rasterizer) {
+                    rasterizer->OnGameSync();
+                }
                 // ASSERT(wait_reg_mem->engine.Value() == PM4CmdWaitRegMem::Engine::Me);
                 // Optimization: VO label waits are special because the emulator
                 // will write to the label when presentation is finished. So if
                 // there are no other submits to yield to we can sleep the thread
                 // instead and allow other tasks to run.
                 const u64* wait_addr = wait_reg_mem->Address<u64*>();
+                if (TraceSync()) {
+                    LogSync("DE", "WAIT_REG_MEM {} {:#x} func={} ref={:#x} mask={:#x} passes={}",
+                            wait_reg_mem->mem_space.Value() == PM4CmdWaitRegMem::MemSpace::Memory
+                                ? "mem"
+                                : "reg",
+                            wait_reg_mem->mem_space.Value() == PM4CmdWaitRegMem::MemSpace::Memory
+                                ? reinterpret_cast<VAddr>(wait_addr)
+                                : VAddr{wait_reg_mem->Reg()},
+                            u32(wait_reg_mem->function.Value()), wait_reg_mem->ref,
+                            wait_reg_mem->mask, wait_reg_mem->Test(regs.reg_array));
+                }
                 if (vo_port->IsVoLabel(wait_addr) &&
                     num_submits == mapped_queues[GfxQueueId].submits.size()) {
+                    const Common::PerfStats::ScopedNs perf_timer{Common::PerfStats::Id::CpVoWaitNs};
                     vo_port->WaitVoLabel([&] { return wait_reg_mem->Test(regs.reg_array); });
                     break;
                 }
-                while (!wait_reg_mem->Test(regs.reg_array)) {
+                while (!CpWaitPasses(wait_reg_mem, regs.reg_array)) {
+                    Common::PerfStats::Add(Common::PerfStats::Id::CpWaitYields);
                     YIELD_GFX();
                 }
                 break;
@@ -825,25 +1278,34 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
             }
             case PM4ItOpcode::StrmoutBufferUpdate: {
                 const auto* strmout = reinterpret_cast<const PM4CmdStrmoutBufferUpdate*>(header);
-                LOG_WARNING(Render_Vulkan,
-                            "Unimplemented IT_STRMOUT_BUFFER_UPDATE, update_memory = {}, "
-                            "source_select = {}, buffer_select = {}",
-                            strmout->update_memory.Value(),
-                            magic_enum::enum_name(strmout->source_select.Value()),
-                            strmout->buffer_select.Value());
+                LOG_RENDER_PROBLEM(Render_Vulkan, Warning,
+                                   "Unimplemented IT_STRMOUT_BUFFER_UPDATE, update_memory = {}, "
+                                   "source_select = {}, buffer_select = {}",
+                                   strmout->update_memory.Value(),
+                                   magic_enum::enum_name(strmout->source_select.Value()),
+                                   strmout->buffer_select.Value());
                 break;
             }
             case PM4ItOpcode::GetLodStats: {
-                LOG_WARNING(Render_Vulkan, "Unimplemented IT_GET_LOD_STATS");
+                const auto* lod_stats = reinterpret_cast<const PM4CmdGetLodStats*>(header);
+                if (rasterizer &&
+                    rasterizer->WriteLodStats(lod_stats->Address(), lod_stats->NumBytes())) {
+                    break;
+                }
+                // Safely ignored unless lod_stats_from_bindings is on. Kept at DEBUG: some titles emit it
+                // every frame
+                LOG_DEBUG(Render_Vulkan, "IT_GET_LOD_STATS ignored");
+                break;
+            }
+            case PM4ItOpcode::PredExec: {
+                // Predicated execution of the next packets on a GPU-evaluated condition; the packets are
+                // executed unconditionally, like a predicate that always passes
+                LOG_DEBUG(Render, "IT_PRED_EXEC ignored");
                 break;
             }
             case PM4ItOpcode::CondExec: {
                 const auto* cond_exec = reinterpret_cast<const PM4CmdCondExec*>(header);
-                if (cond_exec->command.Value() != 0) {
-                    LOG_WARNING(Render, "IT_COND_EXEC used a reserved command");
-                }
-                const auto skip = *cond_exec->Address() == false;
-                if (skip) {
+                if (CondExecSkips(cond_exec, "DE")) {
                     dcb = NextPacket(dcb,
                                      header->type3.NumWords() + 1 + cond_exec->exec_count.Value());
                     continue;
@@ -884,6 +1346,9 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
     size_t acb_size = acb.size_bytes();
     while (!acb.empty()) {
         ProcessCommands();
+        if (rasterizer) {
+            rasterizer->SetCommandRing(static_cast<u8>(vqid + 1));
+        }
 
         auto* header = reinterpret_cast<const PM4Header*>(acb.data());
         u32 next_dw_off = header->type3.NumWords() + 1;
@@ -925,6 +1390,9 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
         }
 
         const PM4ItOpcode opcode = header->type3.opcode;
+        if (CpHistory::Enabled()) {
+            CpHistory::RecordPacket(static_cast<s16>(vqid), acb);
+        }
 
         const auto* it_body = reinterpret_cast<const u32*>(header) + 1;
         switch (opcode) {
@@ -991,6 +1459,14 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
             break;
         }
         case PM4ItOpcode::AcquireMem: {
+            if (rasterizer) {
+                rasterizer->OnGameSync();
+            }
+            if (TraceSync()) {
+                const auto* acquire_mem = reinterpret_cast<const PM4CmdAcquireMem*>(header);
+                LogSync(fmt::format("ASC{}", vqid), "ACQUIRE_MEM cntl={:#x} base={:#x}",
+                        acquire_mem->cp_coher_cntl, acquire_mem->cp_coher_base_lo);
+            }
             break;
         }
         case PM4ItOpcode::Rewind: {
@@ -1027,6 +1503,10 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
         }
         case PM4ItOpcode::DispatchDirect: {
             const auto* dispatch_direct = reinterpret_cast<const PM4CmdDispatchDirect*>(header);
+            if (TraceSync()) {
+                LogSync(fmt::format("ASC{}", vqid), "DISPATCH_DIRECT {}x{}x{}",
+                        dispatch_direct->dim_x, dispatch_direct->dim_y, dispatch_direct->dim_z);
+            }
             if (auto it = std::ranges::find(indirect_patches, header, &IndirectPatch::header);
                 it != indirect_patches.end()) {
                 const auto size = sizeof(PM4CmdDispatchIndirect::GroupDimensions);
@@ -1056,6 +1536,9 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
                 reinterpret_cast<const PM4CmdDispatchIndirectMec*>(header);
             auto& cs_program = GetCsRegs();
             const auto ib_address = dispatch_indirect->Address<VAddr>();
+            if (TraceSync()) {
+                LogSync(fmt::format("ASC{}", vqid), "DISPATCH_INDIRECT args={:#x}", ib_address);
+            }
             const auto size = sizeof(PM4CmdDispatchIndirect::GroupDimensions);
             if (DebugState.DumpingCurrentReg()) {
                 DebugState.PushRegsDumpCompute(base_addr, reinterpret_cast<uintptr_t>(header),
@@ -1074,10 +1557,17 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
             const auto* write_data = reinterpret_cast<const PM4CmdWriteData*>(header);
             ASSERT(write_data->dst_sel.Value() == 2 || write_data->dst_sel.Value() == 5);
             const u32 data_size = (header->type3.count.Value() - 2) * 4;
+            if (TraceSync()) {
+                LogSync(fmt::format("ASC{}", vqid), "WRITE_DATA dst={:#x} bytes={:#x}",
+                        write_data->Address<VAddr>(), data_size);
+            }
             if (!write_data->wr_one_addr.Value()) {
                 if (rasterizer) {
                     rasterizer->OnFence();
                 }
+                Common::GuestWriteJournal::Record(Common::GuestWriteJournal::Source::WriteData,
+                                                  write_data->Address<VAddr>(), data_size,
+                                                  write_data->data, 1);
                 std::memcpy(write_data->Address<void*>(), write_data->data, data_size);
             } else {
                 UNREACHABLE();
@@ -1086,6 +1576,14 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
         }
         case PM4ItOpcode::MemSemaphore: {
             const auto* mem_semaphore = reinterpret_cast<const PM4CmdMemSemaphore*>(header);
+            if (rasterizer && !mem_semaphore->IsSignaling()) {
+                rasterizer->OnGameSync();
+            }
+            if (TraceSync()) {
+                LogSync(fmt::format("ASC{}", vqid), "MEM_SEMAPHORE {} addr={:#x}",
+                        mem_semaphore->IsSignaling() ? "signal" : "wait",
+                        mem_semaphore->Address<VAddr>());
+            }
             if (mem_semaphore->IsSignaling()) {
                 mem_semaphore->Signal();
             } else {
@@ -1098,8 +1596,22 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
         }
         case PM4ItOpcode::WaitRegMem: {
             const auto* wait_reg_mem = reinterpret_cast<const PM4CmdWaitRegMem*>(header);
+            if (rasterizer) {
+                rasterizer->OnGameSync();
+            }
             ASSERT(wait_reg_mem->engine.Value() == PM4CmdWaitRegMem::Engine::Me);
-            while (!wait_reg_mem->Test(regs.reg_array)) {
+            if (TraceSync()) {
+                const bool is_mem =
+                    wait_reg_mem->mem_space.Value() == PM4CmdWaitRegMem::MemSpace::Memory;
+                LogSync(fmt::format("ASC{}", vqid),
+                        "WAIT_REG_MEM {} {:#x} func={} ref={:#x} mask={:#x} passes={}",
+                        is_mem ? "mem" : "reg",
+                        is_mem ? wait_reg_mem->Address<VAddr>() : VAddr{wait_reg_mem->Reg()},
+                        u32(wait_reg_mem->function.Value()), wait_reg_mem->ref,
+                        wait_reg_mem->mask, wait_reg_mem->Test(regs.reg_array));
+            }
+            while (!CpWaitPasses(wait_reg_mem, regs.reg_array)) {
+                Common::PerfStats::Add(Common::PerfStats::Id::CpWaitYields);
                 YIELD_ASC(vqid);
             }
             break;
@@ -1107,8 +1619,20 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
         case PM4ItOpcode::ReleaseMem: {
             const auto* release_mem = reinterpret_cast<const PM4CmdReleaseMem*>(header);
             if (rasterizer) {
+                rasterizer->OnGameSync();
+            }
+            if (TraceSync()) {
+                LogSync(fmt::format("ASC{}", vqid),
+                        "RELEASE_MEM type={} data_sel={} int_sel={} addr={:#x} data={:#x}",
+                        release_mem->event_type.Value(), u32(release_mem->data_sel.Value()),
+                        u32(release_mem->int_sel.Value()),
+                        u64(release_mem->address_hi) << 32 | release_mem->address_lo,
+                        release_mem->data_lo);
+            }
+            if (rasterizer) {
                 rasterizer->OnFence();
             }
+            RecordLabelLag(vqid + 1);
             release_mem->SignalFence(
                 [pipe_id = queue.pipe_id] {
                     Platform::IrqC::Instance()->Signal(static_cast<Platform::InterruptId>(pipe_id));
@@ -1120,6 +1644,38 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
         }
         case PM4ItOpcode::EventWrite: {
             // const auto* event = reinterpret_cast<const PM4CmdEventWrite*>(header);
+            if (rasterizer) {
+                rasterizer->OnGameSync();
+            }
+            break;
+        }
+        case PM4ItOpcode::GetLodStats: {
+            const auto* lod_stats = reinterpret_cast<const PM4CmdGetLodStats*>(header);
+            if (!rasterizer ||
+                !rasterizer->WriteLodStats(lod_stats->Address(), lod_stats->NumBytes())) {
+                LOG_DEBUG(Render_Vulkan, "IT_GET_LOD_STATS ignored (ASC)");
+            }
+            break;
+        }
+        case PM4ItOpcode::PredExec: {
+            // Executed unconditionally, like a predicate that always passes (as on the DE)
+            LOG_DEBUG(Render, "IT_PRED_EXEC ignored (ASC)");
+            break;
+        }
+        case PM4ItOpcode::CondExec: {
+            const auto* cond_exec = reinterpret_cast<const PM4CmdCondExec*>(header);
+            if (CondExecSkips(cond_exec, "ASC")) {
+                // The skipped packets must be in this submission: past its end they wrap around the ring and
+                // would need the next one. Those are executed instead
+                const u32 exec_count = cond_exec->exec_count.Value();
+                if (next_dw_off + exec_count <= acb.size()) {
+                    next_dw_off += exec_count;
+                } else {
+                    LOG_WARNING(Render, "IT_COND_EXEC skip of {} dwords crosses the end of the "
+                                        "ASC submission, executing",
+                                exec_count);
+                }
+            }
             break;
         }
         default:
@@ -1171,17 +1727,45 @@ Liverpool::CmdBuffer Liverpool::CopyCmdBuffers(std::span<const u32> dcb, std::sp
     return std::make_pair(dcb, ccb);
 }
 
+void Liverpool::RecordLabelLag(u32 qid) {
+    if (!Common::PerfStats::Enabled()) {
+        return;
+    }
+    auto& queue = mapped_queues[qid];
+    std::chrono::steady_clock::time_point submitted;
+    {
+        std::scoped_lock lock{queue.m_access};
+        if (queue.submit_times.empty()) {
+            return;
+        }
+        submitted = queue.submit_times.front();
+    }
+    const u64 lag_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                           std::chrono::steady_clock::now() - submitted)
+                           .count();
+    Common::PerfStats::Add(Common::PerfStats::Id::LabelWrites);
+    Common::PerfStats::Add(Common::PerfStats::Id::LabelLagNs, lag_ns);
+    Common::PerfStats::Max(Common::PerfStats::Id::LabelLagMaxNs, lag_ns);
+}
+
 void Liverpool::SubmitGfx(std::span<const u32> dcb, std::span<const u32> ccb) {
     auto& queue = mapped_queues[GfxQueueId];
 
     if (EmulatorSettings.IsCopyGpuBuffers()) {
         std::tie(dcb, ccb) = CopyCmdBuffers(dcb, ccb);
     }
+    if (CpHistory::Enabled()) {
+        CpHistory::RecordSubmit(CpHistory::Queue::De, dcb);
+    }
 
     auto task = ProcessGraphics(dcb, ccb);
     {
         std::scoped_lock lock{queue.m_access};
         queue.submits.emplace(task.handle);
+        if (Common::PerfStats::Enabled()) {
+            queue.submit_times.emplace(std::chrono::steady_clock::now());
+            Common::PerfStats::Max(Common::PerfStats::Id::GfxQueueMax, queue.submits.size());
+        }
     }
 
     std::scoped_lock lk{submit_mutex};
@@ -1194,10 +1778,16 @@ void Liverpool::SubmitAsc(u32 gnm_vqid, std::span<const u32> acb) {
     auto& queue = mapped_queues[gnm_vqid];
 
     const auto vqid = gnm_vqid - 1;
+    if (CpHistory::Enabled()) {
+        CpHistory::RecordSubmit(static_cast<s16>(vqid), acb);
+    }
     const auto& task = ProcessCompute(acb, vqid);
     {
         std::scoped_lock lock{queue.m_access};
         queue.submits.emplace(task.handle);
+        if (Common::PerfStats::Enabled()) {
+            queue.submit_times.emplace(std::chrono::steady_clock::now());
+        }
     }
 
     std::scoped_lock lk{submit_mutex};

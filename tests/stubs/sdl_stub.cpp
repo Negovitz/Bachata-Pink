@@ -12,7 +12,7 @@ extern "C" {
 
 bool SDL_ShowMessageBox(const SDL_MessageBoxData* /* messageboxdata */, int* buttonid) {
     if (buttonid)
-        *buttonid = 0; // "No",skip migration
+        *buttonid = 0; // Choose "No" to skip migration
     return true;
 }
 
