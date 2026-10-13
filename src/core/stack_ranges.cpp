@@ -3,7 +3,9 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <iterator>
+#include <mutex>
 #include <utility>
 #include <vector>
 #include "core/stack_ranges.h"

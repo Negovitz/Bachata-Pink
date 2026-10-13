@@ -24,6 +24,7 @@
 #include "core/emulator_settings.h"
 #include "core/signals.h"
 #include "shader_recompiler/info.h"
+#include "shader_recompiler/ir/breadth_first_search.h"
 #include "shader_recompiler/ir/ir_emitter.h"
 #include "shader_recompiler/ir/opcodes.h"
 #include "shader_recompiler/ir/passes/srt.h"
@@ -1424,7 +1425,7 @@ void FlattenExtendedUserdataPass(IR::Program& program) {
                 continue;
             }
 
-            IR::Inst* ptr_composite = inst.Arg(0).InstRecursive();
+            IR::Inst* ptr_composite = inst.Arg(0).Inst();
             const auto pred = [](IR::Inst* candidate) -> std::optional<IR::Inst*> {
                 if (candidate->GetOpcode() == IR::Opcode::GetUserData ||
                     candidate->GetOpcode() == IR::Opcode::ReadConst) {
