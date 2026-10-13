@@ -66,7 +66,7 @@ jobs:
           set -eux
           runtime/scripts/checkout-component.sh \
             winlator-app https://github.com/brunodev85/winlator-app.git \
-            e113da42beefc39c69c8944b27c19c3703bfa856
+            72ec347c9ced676e206fbc3762b9d567852cb3e3
           runtime/scripts/vendor-vortek.sh
 
       - name: Build Vortek client (aarch64-glibc libvulkan_vortek.so)
@@ -127,7 +127,7 @@ jobs:
         run: |
           runtime/scripts/checkout-component.sh \
             winlator-app https://github.com/brunodev85/winlator-app.git \
-            e113da42beefc39c69c8944b27c19c3703bfa856
+            72ec347c9ced676e206fbc3762b9d567852cb3e3
 
       - name: Download runtime staging artifact
         uses: actions/download-artifact@v4
