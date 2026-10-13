@@ -1356,6 +1356,30 @@ PFN_SrtWalker RegisterWalkerCode(const u8* ptr, size_t size) {
     return function;
 }
 
+
+// The ARM64 walker has no clean-page fast path, so these hooks are inert
+size_t GetSrtCodeUsage() {
+    return 0;
+}
+
+size_t GetSrtCodeShared() {
+    return 0;
+}
+
+std::optional<SrtLoad> DecodeSrtLoad(void* context) {
+    return std::nullopt;
+}
+
+const SrtWalkerContext* GetSrtWalkerContext() {
+    return nullptr;
+}
+
+void SetSrtCleanLoad(bool PS4_SYSV_ABI (*clean_load)(u64, u32, u64*)) {}
+
+void MarkSrtCleanPages(u64 address, u32 size) {}
+
+void CompleteSrtLoad(void* context, const SrtLoad& load, u64 value) {}
+
 } // namespace Shader
 
 namespace Shader::Optimization {
