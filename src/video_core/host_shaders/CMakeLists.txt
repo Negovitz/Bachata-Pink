@@ -1,7 +1,12 @@
 # SPDX-FileCopyrightText: Copyright 2023 Citra Emulator Project
 # SPDX-License-Identifier: GPL-2.0-or-later
 
-if (TARGET glslang-standalone)
+# When cross-compiling, the glslang built for the target cannot run on the build
+# machine; the runtime build script supplies a native one via BACHATA_HOST_GLSLANG.
+set(BACHATA_HOST_GLSLANG "" CACHE FILEPATH "Native glslang used when cross-compiling")
+if (BACHATA_HOST_GLSLANG)
+    set(GLSLANG_COMPILER "${BACHATA_HOST_GLSLANG}")
+elseif (TARGET glslang-standalone)
     set(GLSLANG_COMPILER glslang-standalone)
 elseif (TARGET glslang::glslang-standalone)
     set(GLSLANG_COMPILER glslang::glslang-standalone)

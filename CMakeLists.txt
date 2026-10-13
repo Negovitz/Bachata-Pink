@@ -1326,13 +1326,21 @@ set(EMULATOR src/emulator.cpp
 )
 
 # shadNet protobuf generation
+# When cross-compiling, the protoc built for the target cannot run on the build
+# machine; the runtime build script supplies a native one via BACHATA_HOST_PROTOC.
+set(BACHATA_HOST_PROTOC "" CACHE FILEPATH "Native protoc used when cross-compiling")
+if (BACHATA_HOST_PROTOC)
+    set(SHADNET_PROTOC "${BACHATA_HOST_PROTOC}")
+else()
+    set(SHADNET_PROTOC protobuf::protoc)
+endif()
 set(SHADNET_PROTO_OUT "${CMAKE_CURRENT_BINARY_DIR}/shadnet_proto_gen")
 file(MAKE_DIRECTORY "${SHADNET_PROTO_OUT}")
 add_custom_command(
     OUTPUT
         "${SHADNET_PROTO_OUT}/shadnet.pb.cc"
         "${SHADNET_PROTO_OUT}/shadnet.pb.h"
-    COMMAND protobuf::protoc
+    COMMAND ${SHADNET_PROTOC}
         "--proto_path=${CMAKE_CURRENT_SOURCE_DIR}/src/shadnet"
         "--cpp_out=${SHADNET_PROTO_OUT}"
         "${CMAKE_CURRENT_SOURCE_DIR}/src/shadnet/shadnet.proto"

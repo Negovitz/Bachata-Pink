@@ -23,6 +23,20 @@ clang++ -std=c++23 \
   -Wl,--build-id=sha1 \
   "$font_embed_source" -o "$host_font_embed"
 test -x "$host_font_embed"
+
+# Native glslang + protoc: the aarch64 copies built by the cross build cannot run on
+# this machine, but the shader and shadNet protobuf generators have to run during the build.
+host_native_dir="$host_tools_dir/native-build"
+cmake -S "$project_root/runtime/host-tools" -B "$host_native_dir" -G Ninja \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_C_COMPILER=clang \
+  -DCMAKE_CXX_COMPILER=clang++ \
+  -DCMAKE_CXX_SCAN_FOR_MODULES=OFF
+ninja -C "$host_native_dir" protoc glslang-standalone
+host_glslang="$host_native_dir/glslang/StandAlone/glslang"
+host_protoc="$host_native_dir/protobuf/protoc"
+test -x "$host_glslang"
+test -x "$host_protoc"
 sdl_patch="$project_root/runtime/patches/sdl3-winlator-x11.patch"
 if git -C "$project_root/externals/sdl3" apply --check "$sdl_patch"; then
   git -C "$project_root/externals/sdl3" apply "$sdl_patch"
@@ -71,6 +85,8 @@ cmake -S "$project_root" -B "$build_dir" -G Ninja \
   -DX11_Xext_LIB:FILEPATH="$arm64_xext_lib" \
   -DXEXT_LIB:FILEPATH="$arm64_xext_lib" \
   -DIMGUI_FONT_EMBED_EXECUTABLE="$host_font_embed" \
+  -DBACHATA_HOST_GLSLANG="$host_glslang" \
+  -DBACHATA_HOST_PROTOC="$host_protoc" \
   -DCMAKE_BUILD_TYPE=Release \
   -DCMAKE_CXX_SCAN_FOR_MODULES=OFF \
   -DCMAKE_AR="$llvm_ar" \
@@ -104,7 +120,7 @@ if ! grep -Fq '#define SDL_VIDEO_DRIVER_X11_DYNAMIC_XEXT "libXext.so.6"' "$sdl_c
   exit 1
 fi
 
-cmake --build "$build_dir" --target shadps4
+cmake --build "$build_dir" --target shadps4 -- -k 0
 
 test -f "$binary"
 header=$(readelf -h "$binary")
