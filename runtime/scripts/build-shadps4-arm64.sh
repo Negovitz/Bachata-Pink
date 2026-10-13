@@ -7,7 +7,7 @@ stage_dir="$project_root/runtime/build/shadps4-arm64-stage"
 binary="$build_dir/shadps4"
 host_tools_dir="$project_root/runtime/build/host-tools"
 host_font_embed="$host_tools_dir/Dear_ImGui_FontEmbed"
-font_embed_source="$project_root/externals/dear_imgui/misc/fonts/binary_to_compressed_c.cpp"
+font_embed_source="$project_root/externals/imgui/misc/fonts/binary_to_compressed_c.cpp"
 
 for tool in cmake ninja clang clang++ readelf aarch64-linux-gnu-strip; do
   command -v "$tool" >/dev/null || { echo "$tool is required" >&2; exit 1; }
